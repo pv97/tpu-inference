@@ -123,7 +123,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
         self.logits_indices_selector: list[int] = logits_indices_selector
         self._logprobs_tensors = logprobs_tensors
-    
+
     @time_function
     def get_output(self) -> ModelRunnerOutput:
         next_tokens_cpu = np.asarray(jax.device_get(self._next_tokens))
@@ -243,13 +243,22 @@ def _jax_logprobs_materialize(
     )
 
 
-@functools.partial(jax.jit, static_argnums=(2, 3, 4))
-def unpack_compiled(stacked, metadata_blob, S1, S2, dp_size):
-    input_ids, positions = jnp.unstack(stacked)
-    query_start_loc = metadata_blob[0:S1]
-    seq_lens = metadata_blob[S1:S1 + S2]
-    request_distribution = metadata_blob[S1 + S2:S1 + S2 + dp_size * 3]
-    return input_ids, positions, query_start_loc, seq_lens, request_distribution
+def pack_arrays(
+        arrays: List[np.ndarray]) -> Tuple[np.ndarray, Tuple[int, ...]]:
+    """Concatenate 1D arrays and return the blob and their sizes."""
+    sizes = tuple(a.size for a in arrays)
+    return np.concatenate(arrays), sizes
+
+
+@functools.partial(jax.jit, static_argnums=(1, ))
+def unpack_arrays(blob: jax.Array, sizes: Tuple[int, ...]) -> List[jax.Array]:
+    """Unpack a 1D blob into multiple arrays based on recorded sizes."""
+    outputs = []
+    curr = 0
+    for size in sizes:
+        outputs.append(blob[curr:curr + size])
+        curr += size
+    return outputs
 
 
 class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
@@ -657,11 +666,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # jax.random.split produces replicated keys and the jitted sample()
         # function does not trigger a DevicePutWithSharding to broadcast
         # from a single device at every step.
-        rng_key = nnx.Rngs(
-            jax.random.key(self.model_config.seed)).params()
+        rng_key = nnx.Rngs(jax.random.key(self.model_config.seed)).params()
         replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
-        self.rng_params_for_sampling = jax.device_put(
-            rng_key, replicated_sharding)
+        self.rng_params_for_sampling = jax.device_put(rng_key,
+                                                      replicated_sharding)
 
         # This allows a multi-modal model to be used as text-only, assuming the user
         # passes the following to vLLM (on the CLI):
@@ -1248,14 +1256,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                    scheduler_output: "VllmSchedulerOutput"):
 
         dp_size = self.dp_size
-        num_reqs = self.input_batch.num_reqs
         max_num_reqs_per_dp_rank = self.max_num_reqs // dp_size
 
         # Use pre-computed per-rank metadata from DPSchedulerOutput when
         # available, avoiding an O(num_reqs) re-split by assigned_dp_rank.
         req_ids_dp = getattr(scheduler_output, 'req_ids_per_rank', None)
-        scheduled_tokens_per_dp_rank = getattr(
-            scheduler_output, 'scheduled_tokens_per_rank', None)
+        scheduled_tokens_per_dp_rank = getattr(scheduler_output,
+                                               'scheduled_tokens_per_rank',
+                                               None)
 
         # Build the remaining derived structures from pre-computed data.
         req_indices_dp = {
@@ -1273,7 +1281,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             dp_rank: len(req_ids_dp[dp_rank])
             for dp_rank in range(dp_size)
         }
-    # Find maximum number of scheduled tokens across DP ranks
+        # Find maximum number of scheduled tokens across DP ranks
         max_num_scheduled_tokens_across_dp = max(
             num_scheduled_tokens_per_dp_rank.values())
 
@@ -1592,7 +1600,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         stacked_tokens = np.stack([input_ids, positions])
 
         # Monolithic stack packing for small 1D metadata buffers
-        metadata_blob = np.concatenate([
+        metadata_blob, metadata_sizes = pack_arrays([
             query_start_loc,  # already static bound max_num_reqs + dp_size
             seq_lens,  # already static bound max_num_reqs
             request_distribution  # size dp_size * 3
@@ -1636,7 +1644,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # metadata and block tables are laid out in contiguous per-DP-rank
         # chunks. stacked_tokens has an extra leading dim (input_ids, positions).
         sharding_payload = {
-            k: data_parallel_attn_sharding for k in host_arrays_payload
+            k: data_parallel_attn_sharding
+            for k in host_arrays_payload
         }
         sharding_payload["stacked_tokens"] = NamedSharding(
             self.mesh, PartitionSpec(None, ShardingAxisName.ATTN_DATA))
@@ -1652,11 +1661,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         metadata_blob_dev = dev_arrays_payload["metadata_blob"]
         logits_indices = dev_arrays_payload["logits_indices"]
 
-        S1 = self.max_num_reqs + dp_size
-        S2 = self.max_num_reqs
-
-        input_ids, positions, query_start_loc, seq_lens, request_distribution = unpack_compiled(
-            stacked_tokens_dev, metadata_blob_dev, S1, S2, dp_size)
+        input_ids, positions = jnp.unstack(stacked_tokens_dev)
+        query_start_loc, seq_lens, request_distribution = unpack_arrays(
+            metadata_blob_dev, metadata_sizes)
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
