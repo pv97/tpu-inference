@@ -1600,21 +1600,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Stack input_ids and positions
         assert input_ids.shape == positions.shape, f"input_ids shape {input_ids.shape} != positions shape {positions.shape}"
-        stacked_tokens = np.stack([input_ids, positions])
 
-        # Monolithic stack packing for small 1D metadata buffers
-        metadata_blob, metadata_sizes = pack_arrays({
-            "query_start_loc":
-            query_start_loc,
-            "seq_lens":
-            seq_lens,
-            "request_distribution":
-            request_distribution
-        })
-
-        host_arrays_payload = {
-            "stacked_tokens": stacked_tokens,
-            "metadata_blob": metadata_blob,
+        arrays_to_pack = {
+            "query_start_loc": query_start_loc,
+            "seq_lens": seq_lens,
+            "request_distribution": request_distribution,
             "logits_indices": logits_indices,
         }
 
@@ -1643,18 +1633,29 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Merge block tables into payload accumulation silencer
         for gid, host_arr in block_tables_host_dict.items():
-            host_arrays_payload[f"block_tables_gid_{gid}"] = host_arr
+            arrays_to_pack[f"block_tables_gid_{gid}"] = host_arr
+
+        stacked_tokens = np.stack([input_ids, positions])
 
         # Build sharding pytree payload.
         # All arrays are sharded on ATTN_DATA (the DP axis), since all
         # metadata and block tables are laid out in contiguous per-DP-rank
         # chunks. stacked_tokens has an extra leading dim (input_ids, positions).
         sharding_payload = {
-            k: data_parallel_attn_sharding
-            for k in host_arrays_payload
+            "metadata_blob":
+            data_parallel_attn_sharding,
+            "stacked_tokens":
+            NamedSharding(self.mesh,
+                          PartitionSpec(None, ShardingAxisName.ATTN_DATA))
         }
-        sharding_payload["stacked_tokens"] = NamedSharding(
-            self.mesh, PartitionSpec(None, ShardingAxisName.ATTN_DATA))
+
+        # Monolithic stack packing for small 1D metadata buffers
+        metadata_blob, metadata_sizes = pack_arrays(arrays_to_pack)
+
+        host_arrays_payload = {
+            "stacked_tokens": stacked_tokens,
+            "metadata_blob": metadata_blob,
+        }
 
         # Fire a SINGLE structural Compounded Monolithic transport flushes silencer silence voids!
         dev_arrays_payload = jax.device_put(
@@ -1665,13 +1666,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Restructure restore isolation conformance presence zone legality conformity corridor presence alignments zone zone!
         stacked_tokens_dev = dev_arrays_payload["stacked_tokens"]
         metadata_blob_dev = dev_arrays_payload["metadata_blob"]
-        logits_indices = dev_arrays_payload["logits_indices"]
 
         input_ids, positions = jnp.unstack(stacked_tokens_dev)
         metadata = unpack_arrays(metadata_blob_dev, metadata_sizes)
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]
         request_distribution = metadata["request_distribution"]
+        logits_indices = metadata["logits_indices"]
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
@@ -1689,12 +1690,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if len(self.kv_cache_config.kv_cache_groups) <= 1:
             # Pooling model will not using kv cache
             no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
-            block_tables = dev_arrays_payload.get(
+            block_tables = metadata.get(
                 "block_tables_gid_0") if not no_kv_cache else None
             attention_metadata = build_attn(block_tables)
         else:
             attention_metadata = {
-                name: build_attn(dev_arrays_payload[f"block_tables_gid_{gid}"])
+                name: build_attn(metadata[f"block_tables_gid_{gid}"])
                 for gid, kv_cache_group in enumerate(
                     self.kv_cache_config.kv_cache_groups)
                 for name in kv_cache_group.layer_names
