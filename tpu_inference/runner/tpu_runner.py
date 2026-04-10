@@ -244,19 +244,22 @@ def _jax_logprobs_materialize(
 
 
 def pack_arrays(
-        arrays: List[np.ndarray]) -> Tuple[np.ndarray, Tuple[int, ...]]:
-    """Concatenate 1D arrays and return the blob and their sizes."""
-    sizes = tuple(a.size for a in arrays)
-    return np.concatenate(arrays), sizes
+    arrays: Dict[str, np.ndarray]
+) -> Tuple[np.ndarray, Tuple[Tuple[str, int], ...]]:
+    """Concatenate 1D arrays and return the blob and their (key, size) pairs."""
+    blob = np.concatenate(list(arrays.values()))
+    sizes = tuple((k, v.size) for k, v in arrays.items())
+    return blob, sizes
 
 
 @functools.partial(jax.jit, static_argnums=(1, ))
-def unpack_arrays(blob: jax.Array, sizes: Tuple[int, ...]) -> List[jax.Array]:
-    """Unpack a 1D blob into multiple arrays based on recorded sizes."""
-    outputs = []
+def unpack_arrays(blob: jax.Array, sizes: Tuple[Tuple[str, int],
+                                                ...]) -> Dict[str, jax.Array]:
+    """Unpack a 1D blob into a dictionary of arrays based on recorded sizes."""
+    outputs = {}
     curr = 0
-    for size in sizes:
-        outputs.append(blob[curr:curr + size])
+    for key, size in sizes:
+        outputs[key] = blob[curr:curr + size]
         curr += size
     return outputs
 
@@ -1600,11 +1603,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         stacked_tokens = np.stack([input_ids, positions])
 
         # Monolithic stack packing for small 1D metadata buffers
-        metadata_blob, metadata_sizes = pack_arrays([
-            query_start_loc,  # already static bound max_num_reqs + dp_size
-            seq_lens,  # already static bound max_num_reqs
-            request_distribution  # size dp_size * 3
-        ])
+        metadata_blob, metadata_sizes = pack_arrays({
+            "query_start_loc":
+            query_start_loc,
+            "seq_lens":
+            seq_lens,
+            "request_distribution":
+            request_distribution
+        })
 
         host_arrays_payload = {
             "stacked_tokens": stacked_tokens,
@@ -1662,8 +1668,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         logits_indices = dev_arrays_payload["logits_indices"]
 
         input_ids, positions = jnp.unstack(stacked_tokens_dev)
-        query_start_loc, seq_lens, request_distribution = unpack_arrays(
-            metadata_blob_dev, metadata_sizes)
+        metadata = unpack_arrays(metadata_blob_dev, metadata_sizes)
+        query_start_loc = metadata["query_start_loc"]
+        seq_lens = metadata["seq_lens"]
+        request_distribution = metadata["request_distribution"]
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
