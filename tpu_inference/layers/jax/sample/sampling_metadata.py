@@ -20,10 +20,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from jax.sharding import Mesh
 
 from tpu_inference.runner.input_batch import InputBatch
-from tpu_inference.utils import device_array
 
 DEFAULT_SAMPLING_PARAMS = dict(
     temperature=-1.0,
@@ -52,23 +50,26 @@ class TPUSupportedSamplingMetadata:
     logprobs: bool = False
 
     @classmethod
+    def create_cache_collision_dummy(cls,
+                                     input_batch: InputBatch,
+                                     dp_size: int = 1) -> jax.Array:
+        needs_logprobs = input_batch.max_num_logprobs > 0 if input_batch.max_num_logprobs else False
+        # Use a dummy tensor with a unique shape for each logprobs config.
+        # This avoids persistent cache collisions.
+        # We also pad to a multiple of dp_size to avoid IndivisibleError when sharding.
+        dummy_shape = ((1 if needs_logprobs else 2) * dp_size, )
+        cache_collision_dummy = np.zeros(dummy_shape, dtype=np.int32)
+        return cache_collision_dummy
+
+    @classmethod
     def from_input_batch(
         cls,
-        mesh: Mesh,
+        cache_collision_dummy: jax.Array,
         input_batch: InputBatch,
         padded_num_reqs: int,
         sharding: Optional[jax.sharding.Sharding] = None,
     ) -> "TPUSupportedSamplingMetadata":
         needs_logprobs = input_batch.max_num_logprobs > 0 if input_batch.max_num_logprobs else False
-
-        # Use a dummy tensor with a unique shape for each logprobs config.
-        # This avoids persistent cache collisions.
-        dummy_shape = (1 if needs_logprobs else 2, )
-        cache_collision_dummy = np.zeros(dummy_shape, dtype=np.int32)
-        # Use replicated sharding for dummy tensor.
-        cache_collision_dummy = device_array(mesh,
-                                             cache_collision_dummy,
-                                             sharding=None)
 
         if input_batch.all_greedy:
             return cls(do_sampling=False,

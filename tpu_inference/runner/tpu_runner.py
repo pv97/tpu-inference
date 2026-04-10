@@ -1588,24 +1588,20 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 ))
             logits_indices = spec_decode_metadata.final_logits_indices
 
-        # Put to device
-        sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
-            self.mesh,
-            self.input_batch,
-            padded_num_reqs,
-            sharding=data_parallel_attn_sharding,
-        )
         if self.uses_mrope:
             positions = mrope_positions
 
         # Stack input_ids and positions
         assert input_ids.shape == positions.shape, f"input_ids shape {input_ids.shape} != positions shape {positions.shape}"
 
+        cache_collision_dummy = TPUSupportedSamplingMetadata.create_cache_collision_dummy(
+            self.input_batch, dp_size=dp_size)
         arrays_to_pack = {
             "query_start_loc": query_start_loc,
             "seq_lens": seq_lens,
             "request_distribution": request_distribution,
             "logits_indices": logits_indices,
+            "cache_collision_dummy": cache_collision_dummy,
         }
 
         # Collect block tables host arrays loops zone presence zones legality
@@ -1728,6 +1724,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 total_num_scheduled_tokens,
                 padded_total_num_scheduled_tokens,
             )
+
+        sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
+            metadata["cache_collision_dummy"],
+            self.input_batch,
+            padded_num_reqs,
+            sharding=data_parallel_attn_sharding,
+        )
 
         return (
             input_ids,
@@ -1864,25 +1867,27 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 padded_num_reqs)
             logits_indices = spec_decode_metadata.final_logits_indices
 
-        # Put to device
-        sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
-            self.mesh,
-            self.input_batch,
-            padded_num_reqs,
-            sharding=data_parallel_attn_sharding,
-        )
         if self.uses_mrope:
             positions = mrope_positions
         query_start_loc_cpu = query_start_loc
         seq_lens_cpu = seq_lens
+        cache_collision_dummy = TPUSupportedSamplingMetadata.create_cache_collision_dummy(
+            self.input_batch, dp_size=self.dp_size)
 
         (input_ids, positions, query_start_loc, seq_lens, logits_indices,
-         request_distribution) = device_array(
+         request_distribution, cache_collision_dummy) = device_array(
              self.mesh,
              (input_ids, positions, query_start_loc, seq_lens, logits_indices,
-              request_distribution),
+              request_distribution, cache_collision_dummy),
              sharding=data_parallel_attn_sharding,
          )
+
+        sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(
+            cache_collision_dummy,
+            self.input_batch,
+            padded_num_reqs,
+            sharding=data_parallel_attn_sharding,
+        )
 
         def build_block_table(kv_cache_gid: int) -> jax.Array:
             block_tables = self.block_tables_cpu[kv_cache_gid][:self.
