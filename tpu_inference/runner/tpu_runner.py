@@ -123,7 +123,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
         self.logits_indices_selector: list[int] = logits_indices_selector
         self._logprobs_tensors = logprobs_tensors
-    
+
     @time_function
     def get_output(self) -> ModelRunnerOutput:
         next_tokens_cpu = np.asarray(jax.device_get(self._next_tokens))
@@ -241,15 +241,6 @@ def _jax_logprobs_materialize(
         sampled_token_ranks=np.array(selected_token_ranks.tolist()),
         cu_num_generated_tokens=cu_num_generated_tokens,
     )
-
-
-@functools.partial(jax.jit, static_argnums=(2, 3, 4))
-def unpack_compiled(stacked, metadata_blob, S1, S2, dp_size):
-    input_ids, positions = jnp.unstack(stacked)
-    query_start_loc = metadata_blob[0:S1]
-    seq_lens = metadata_blob[S1:S1 + S2]
-    request_distribution = metadata_blob[S1 + S2:S1 + S2 + dp_size * 3]
-    return input_ids, positions, query_start_loc, seq_lens, request_distribution
 
 
 class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
@@ -531,13 +522,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.input_ids_cpu = np.zeros(self.max_num_tokens, dtype=np.int32)
         self.positions_cpu = np.zeros(self.max_num_tokens, dtype=np.int32)
-        # Note: self.input_batch and self.block_tables_cpu are both initialized
-        # with only 1 block_size. For hybrid kv cache, it will be re-init
-        # in kv_cache_manager's maybe_reinitialize_input_batch.
-        self.block_tables_cpu = [
-            np.zeros((self.max_num_reqs, self.max_num_blocks_per_req),
-                     dtype=np.int32)
-        ]
 
         self.query_start_loc_cpu = np.zeros(self.max_num_reqs + self.dp_size,
                                             dtype=np.int32)
@@ -592,6 +576,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # See page 5 of https://arxiv.org/abs/2409.12191
         self.mrope_positions_cpu = np.zeros((3, self.max_num_tokens),
                                             dtype=np.int64)
+
+        # Monolithic stack packing for small 1D metadata buffers.
+        # This buffer grows dynamically to accommodate metadata and block tables.
+        self.device_buffer = common_utils.DeviceBuffer()
 
     def _device_array_via_colocated(
         self,
@@ -657,11 +645,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # jax.random.split produces replicated keys and the jitted sample()
         # function does not trigger a DevicePutWithSharding to broadcast
         # from a single device at every step.
-        rng_key = nnx.Rngs(
-            jax.random.key(self.model_config.seed)).params()
+        rng_key = nnx.Rngs(jax.random.key(self.model_config.seed)).params()
         replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
-        self.rng_params_for_sampling = jax.device_put(
-            rng_key, replicated_sharding)
+        self.rng_params_for_sampling = jax.device_put(rng_key,
+                                                      replicated_sharding)
 
         # This allows a multi-modal model to be used as text-only, assuming the user
         # passes the following to vLLM (on the CLI):
@@ -1248,14 +1235,14 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                    scheduler_output: "VllmSchedulerOutput"):
 
         dp_size = self.dp_size
-        num_reqs = self.input_batch.num_reqs
         max_num_reqs_per_dp_rank = self.max_num_reqs // dp_size
 
         # Use pre-computed per-rank metadata from DPSchedulerOutput when
         # available, avoiding an O(num_reqs) re-split by assigned_dp_rank.
         req_ids_dp = getattr(scheduler_output, 'req_ids_per_rank', None)
-        scheduled_tokens_per_dp_rank = getattr(
-            scheduler_output, 'scheduled_tokens_per_rank', None)
+        scheduled_tokens_per_dp_rank = getattr(scheduler_output,
+                                               'scheduled_tokens_per_rank',
+                                               None)
 
         # Build the remaining derived structures from pre-computed data.
         req_indices_dp = {
@@ -1273,7 +1260,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             dp_rank: len(req_ids_dp[dp_rank])
             for dp_rank in range(dp_size)
         }
-    # Find maximum number of scheduled tokens across DP ranks
+        # Find maximum number of scheduled tokens across DP ranks
         max_num_scheduled_tokens_across_dp = max(
             num_scheduled_tokens_per_dp_rank.values())
 
@@ -1592,11 +1579,36 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         stacked_tokens = np.stack([input_ids, positions])
 
         # Monolithic stack packing for small 1D metadata buffers
-        metadata_blob = np.concatenate([
-            query_start_loc,  # already static bound max_num_reqs + dp_size
-            seq_lens,  # already static bound max_num_reqs
-            request_distribution  # size dp_size * 3
-        ])
+        self.device_buffer.reset()
+        self.device_buffer.append(query_start_loc, key="query_start_loc")
+        self.device_buffer.append(seq_lens, key="seq_lens")
+        self.device_buffer.append(request_distribution,
+                                  key="request_distribution")
+
+        # Collect block tables host arrays loops zone presence zones legality
+        def build_block_table_host(kv_cache_gid: int) -> None:
+            block_tables_view = self.device_buffer.get_view(
+                (self.max_num_reqs, self.max_num_blocks_per_req),
+                key=f"block_tables_gid_{kv_cache_gid}")
+
+            for dp_rank in range(dp_size):
+                req_offset = dp_rank * max_num_reqs_per_dp_rank
+                _num_reqs = num_req_per_dp_rank[dp_rank]
+                block_tables_view[
+                    req_offset:req_offset + _num_reqs, :self.
+                    max_num_blocks_per_req] = self.input_batch.block_table[
+                        kv_cache_gid].get_cpu_tensor()[req_indices_dp[dp_rank]]
+
+        if len(self.kv_cache_config.kv_cache_groups) <= 1:
+            no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
+            if not no_kv_cache:
+                build_block_table_host(0)
+        else:
+            for gid, kv_cache_group in enumerate(
+                    self.kv_cache_config.kv_cache_groups):
+                build_block_table_host(gid)
+
+        metadata_blob, metadata_layout = self.device_buffer.build()
 
         host_arrays_payload = {
             "stacked_tokens": stacked_tokens,
@@ -1604,39 +1616,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "logits_indices": logits_indices,
         }
 
-        # Collect block tables host arrays loops zone presence zones legality
-        def build_block_table_host(kv_cache_gid: int) -> np.ndarray:
-            block_tables = self.block_tables_cpu[kv_cache_gid][:self.
-                                                               max_num_reqs]
-            for dp_rank in range(dp_size):
-                req_offset = dp_rank * max_num_reqs_per_dp_rank
-                _num_reqs = num_req_per_dp_rank[dp_rank]
-                block_tables[
-                    req_offset:req_offset + _num_reqs, :self.
-                    max_num_blocks_per_req] = self.input_batch.block_table[
-                        kv_cache_gid].get_cpu_tensor()[req_indices_dp[dp_rank]]
-            return block_tables.reshape(-1)
-
-        block_tables_host_dict = {}
-        if len(self.kv_cache_config.kv_cache_groups) <= 1:
-            no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
-            if not no_kv_cache:
-                block_tables_host_dict[0] = build_block_table_host(0)
-        else:
-            for gid, kv_cache_group in enumerate(
-                    self.kv_cache_config.kv_cache_groups):
-                block_tables_host_dict[gid] = build_block_table_host(gid)
-
-        # Merge block tables into payload accumulation silencer
-        for gid, host_arr in block_tables_host_dict.items():
-            host_arrays_payload[f"block_tables_gid_{gid}"] = host_arr
-
         # Build sharding pytree payload.
         # All arrays are sharded on ATTN_DATA (the DP axis), since all
         # metadata and block tables are laid out in contiguous per-DP-rank
         # chunks. stacked_tokens has an extra leading dim (input_ids, positions).
         sharding_payload = {
-            k: data_parallel_attn_sharding for k in host_arrays_payload
+            k: data_parallel_attn_sharding
+            for k in host_arrays_payload
         }
         sharding_payload["stacked_tokens"] = NamedSharding(
             self.mesh, PartitionSpec(None, ShardingAxisName.ATTN_DATA))
@@ -1652,11 +1638,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         metadata_blob_dev = dev_arrays_payload["metadata_blob"]
         logits_indices = dev_arrays_payload["logits_indices"]
 
-        S1 = self.max_num_reqs + dp_size
-        S2 = self.max_num_reqs
-
-        input_ids, positions, query_start_loc, seq_lens, request_distribution = unpack_compiled(
-            stacked_tokens_dev, metadata_blob_dev, S1, S2, dp_size)
+        input_ids, positions = jnp.unstack(stacked_tokens_dev)
+        metadata = common_utils.DeviceBuffer.unpack_arrays(
+            metadata_blob_dev, metadata_layout)
+        query_start_loc = metadata["query_start_loc"]
+        seq_lens = metadata["seq_lens"]
+        request_distribution = metadata["request_distribution"]
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
@@ -1674,12 +1661,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if len(self.kv_cache_config.kv_cache_groups) <= 1:
             # Pooling model will not using kv cache
             no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
-            block_tables = dev_arrays_payload.get(
+            block_tables = metadata.get(
                 "block_tables_gid_0") if not no_kv_cache else None
             attention_metadata = build_attn(block_tables)
         else:
             attention_metadata = {
-                name: build_attn(dev_arrays_payload[f"block_tables_gid_{gid}"])
+                name: build_attn(metadata[f"block_tables_gid_{gid}"])
                 for gid, kv_cache_group in enumerate(
                     self.kv_cache_config.kv_cache_groups)
                 for name in kv_cache_group.layer_names
@@ -1860,28 +1847,70 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         query_start_loc_cpu = query_start_loc
         seq_lens_cpu = seq_lens
 
-        (input_ids, positions, query_start_loc, seq_lens, logits_indices,
-         request_distribution) = device_array(
-             self.mesh,
-             (input_ids, positions, query_start_loc, seq_lens, logits_indices,
-              request_distribution),
-             sharding=data_parallel_attn_sharding,
-         )
+        # Monolithic stack packing for small 1D metadata buffers
+        self.device_buffer.reset()
+        self.device_buffer.append(query_start_loc, key="query_start_loc")
+        self.device_buffer.append(seq_lens, key="seq_lens")
+        self.device_buffer.append(request_distribution,
+                                  key="request_distribution")
 
-        def build_block_table(kv_cache_gid: int) -> jax.Array:
-            block_tables = self.block_tables_cpu[kv_cache_gid][:self.
-                                                               max_num_reqs]
-            block_tables[:num_reqs] = (
+        # Collect block tables host arrays loops zone presence zones legality
+        def build_block_table_host(kv_cache_gid: int) -> None:
+            block_tables_view = self.device_buffer.get_view(
+                (self.max_num_reqs, self.max_num_blocks_per_req),
+                key=f"block_tables_gid_{kv_cache_gid}")
+
+            block_tables_view[:num_reqs] = (
                 self.input_batch.block_table[kv_cache_gid].get_cpu_tensor()
                 [:num_reqs])
-            # Convert block_tables to 1D on cpu.
-            block_tables = block_tables.reshape(-1)
-            block_tables = device_array(
-                self.mesh,
-                (block_tables),
-                sharding=data_parallel_attn_sharding,
-            )
-            return block_tables
+            block_tables_view[num_reqs:] = 0
+
+        if len(self.kv_cache_config.kv_cache_groups) <= 1:
+            # Pooling model will not using kv cache
+            no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
+            if not no_kv_cache:
+                build_block_table_host(0)
+        else:
+            for gid, kv_cache_group in enumerate(
+                    self.kv_cache_config.kv_cache_groups):
+                build_block_table_host(gid)
+
+        metadata_blob, metadata_layout = self.device_buffer.build()
+
+        host_arrays_payload = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "metadata_blob": metadata_blob,
+            "logits_indices": logits_indices,
+        }
+        if self.uses_mrope:
+            host_arrays_payload["positions"] = mrope_positions
+
+        # Build sharding pytree payload.
+        # All arrays are sharded on ATTN_DATA (the DP axis), since all
+        # metadata and block tables are laid out in contiguous per-DP-rank
+        # chunks.
+        sharding_payload = {
+            k: data_parallel_attn_sharding
+            for k in host_arrays_payload
+        }
+
+        # Fire a SINGLE structural Compounded Monolithic transport flushes silencer silence voids!
+        dev_arrays_payload = jax.device_put(
+            host_arrays_payload,
+            sharding_payload,
+        )
+
+        input_ids = dev_arrays_payload["input_ids"]
+        positions = dev_arrays_payload["positions"]
+        metadata_blob_dev = dev_arrays_payload["metadata_blob"]
+        logits_indices = dev_arrays_payload["logits_indices"]
+
+        metadata = common_utils.DeviceBuffer.unpack_arrays(
+            metadata_blob_dev, metadata_layout)
+        query_start_loc = metadata["query_start_loc"]
+        seq_lens = metadata["seq_lens"]
+        request_distribution = metadata["request_distribution"]
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
@@ -1899,11 +1928,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if len(self.kv_cache_config.kv_cache_groups) <= 1:
             # Pooling model will not using kv cache
             no_kv_cache = len(self.kv_cache_config.kv_cache_groups) == 0
-            block_tables = build_block_table(0) if not no_kv_cache else None
+            block_tables = metadata.get(
+                "block_tables_gid_0") if not no_kv_cache else None
             attention_metadata = build_attn(block_tables)
         else:
             attention_metadata = {
-                name: build_attn(build_block_table(gid))
+                name: build_attn(metadata[f"block_tables_gid_{gid}"])
                 for gid, kv_cache_group in enumerate(
                     self.kv_cache_config.kv_cache_groups)
                 for name in kv_cache_group.layer_names
