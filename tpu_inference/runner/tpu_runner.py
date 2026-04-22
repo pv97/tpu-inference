@@ -1564,9 +1564,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         dev_arrays_payload = jax.device_put(metadata_blob,
                                             data_parallel_attn_sharding)
 
-        metadata = common_utils.DeviceBuffer.unpack_arrays(dev_arrays_payload,
-                                                           metadata_layout,
-                                                           shape=(-1, ))
+        metadata = common_utils.DeviceBuffer.unpack_arrays(
+            dev_arrays_payload,
+            metadata_layout,
+            shape=(-1, ),
+        )
+
         input_ids = metadata["input_ids"]
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]
@@ -1851,9 +1854,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         dev_arrays_payload = jax.device_put(metadata_blob,
                                             data_parallel_attn_sharding)
 
-        metadata = common_utils.DeviceBuffer.unpack_arrays(dev_arrays_payload,
-                                                           metadata_layout,
-                                                           shape=(-1, ))
+        metadata = common_utils.DeviceBuffer.unpack_arrays(
+            dev_arrays_payload,
+            metadata_layout,
+            shape=(-1, ),
+        )
+
         input_ids = metadata["input_ids"]
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]
