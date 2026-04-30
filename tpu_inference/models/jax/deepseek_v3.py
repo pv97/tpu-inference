@@ -1122,8 +1122,7 @@ class DeepSeekV3(JaxModule):
                  quant_config,
                  prefix: str = ""):
         self.vllm_config = vllm_config
-        self.enable_return_routed_experts = self.vllm_config.additional_config.get(
-            "enable_return_routed_experts", False)
+        self.enable_return_routed_experts = self.vllm_config.model_config.enable_return_routed_experts
 
         self.use_mla_kernel: bool = self.vllm_config.model_config.use_mla
 

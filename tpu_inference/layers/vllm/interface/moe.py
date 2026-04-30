@@ -85,10 +85,7 @@ def vllm_moe_apply(layer: FusedMoE, weights: FusedMoEWeights,
     except AssertionError:
         vllm_config = None
 
-    enable_return_routed_experts = vllm_config.additional_config.get(
-        "enable_return_routed_experts", False) if vllm_config and hasattr(
-            vllm_config, 'additional_config') and isinstance(
-                vllm_config.additional_config, dict) else False
+    enable_return_routed_experts = vllm_config.model_config.enable_return_routed_experts if vllm_config else False
 
     if enable_return_routed_experts:
         if isinstance(router_logits, torch.Tensor):

@@ -15,7 +15,23 @@
 
 def update_vllm_scheduler_for_exporting_expert_ids():
     # Monkeypatch vLLM Scheduler to attach expert indices to outputs
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import \
+        RoutedExpertsReader
     from vllm.v1.core.sched.scheduler import Scheduler
+
+    class DummyRoutedExpertsReader:
+
+        @staticmethod
+        def create():
+            return DummyRoutedExpertsReader()
+
+        def attach_buffer(self, *args, **kwargs):
+            pass
+
+        def get_routed_experts(self, *args, **kwargs):
+            return None
+
+    RoutedExpertsReader.create = DummyRoutedExpertsReader.create
 
     original_update_from_output = Scheduler.update_from_output
 

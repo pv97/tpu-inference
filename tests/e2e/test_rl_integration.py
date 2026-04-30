@@ -290,9 +290,7 @@ class TestMoEExpertIds:
         """routed_experts must be properly shaped if it is an MoE, or None if not."""
         prompt = "The capital of France is"
         # Test standard execution with the flag enabled.
-        # To bypass vllm native validation we can inject it into additional_config safely
-        llm.llm_engine.vllm_config.additional_config[
-            "enable_return_routed_experts"] = True
+        llm.llm_engine.vllm_config.model_config.enable_return_routed_experts = True
 
         sampling_params = SamplingParams(temperature=0, max_tokens=10)
         outputs = llm.generate([prompt], sampling_params)

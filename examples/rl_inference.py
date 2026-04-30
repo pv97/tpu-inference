@@ -39,9 +39,7 @@ def main(args: dict):
     log_probs = args.pop("log_probs")
 
     # Create an LLM
-    if "additional_config" not in args or args["additional_config"] is None:
-        args["additional_config"] = {}
-    args["additional_config"]["enable_return_routed_experts"] = True
+    args["enable_return_routed_experts"] = True
     llm = LLM(**args)
 
     # Create a sampling params object
