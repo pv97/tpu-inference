@@ -106,6 +106,7 @@ class CompilationManager:
                 self._precompile_backbone_with_inputs_embeds()
             if self.runner.scheduler_config.async_scheduling:
                 self._precompile_substitute_placeholder_token()
+            self._precompile_unpack_arrays()
             if not self.runner.is_last_rank:
                 return
             self._precompile_select_from_array()
@@ -126,6 +127,61 @@ class CompilationManager:
 
         elapsed = time.perf_counter() - compilation_start_time
         self.runner.vllm_config.compilation_config.compilation_time += elapsed
+
+    def _precompile_unpack_arrays(self) -> None:
+        logger.info("Compiling unpack_arrays with different input shapes.")
+        from tpu_inference.utils import DeviceBuffer, DeviceBufferMetadata
+
+        dp_size = self.runner.dp_size
+        max_num_reqs = self.runner.max_num_reqs
+
+        # Determine keys and sizes that don't depend on padding
+        if dp_size > 1:
+            base_keys = [
+                "input_ids", "query_start_loc", "seq_lens", "logits_indices"
+            ]
+            base_sizes = [None, max_num_reqs + dp_size, max_num_reqs, None]
+            logits_index = 3
+        else:
+            base_keys = [
+                "input_ids", "logits_indices", "query_start_loc", "seq_lens"
+            ]
+            base_sizes = [None, None, max_num_reqs + 1, max_num_reqs]
+            logits_index = 1
+
+        # Add block tables
+        for gid, _ in enumerate(self.runner.kv_cache_config.kv_cache_groups):
+            base_keys.append(f"block_tables_gid_{gid}")
+            block_table_obj = self.runner.input_batch.block_table[gid]
+            base_sizes.append(max_num_reqs *
+                              block_table_obj.max_num_blocks_per_req)
+
+        # Iterate over paddings
+        logits_paddings = []
+        if self.runner.speculative_config:
+            logits_paddings.extend(self.runner.num_logits_paddings)
+        logits_paddings.extend(self.runner.num_reqs_paddings)
+        logits_paddings = sorted(list(set(logits_paddings)))
+        for num_tokens in self.runner.num_tokens_paddings:
+            for logits_padding in logits_paddings:
+                sizes = list(base_sizes)
+                sizes[0] = num_tokens
+                sizes[logits_index] = logits_padding
+
+                metadata = DeviceBufferMetadata(keys=tuple(base_keys),
+                                                sizes=tuple(sizes))
+                total_size = sum(sizes)
+
+                blob = self._create_dummy_tensor((total_size, ), jnp.int32)
+
+                self._run_compilation(
+                    "unpack_arrays",
+                    DeviceBuffer.unpack_arrays,
+                    blob,
+                    metadata,
+                    num_tokens=num_tokens,
+                    logits_padding=logits_padding,
+                )
 
     def _precompile_input_embeddings_merger(self) -> None:
         for num_tokens in self.runner.num_tokens_paddings:
@@ -479,10 +535,11 @@ class CompilationManager:
         logger.info("Compiling select_from_array with different input shapes.")
         hsize = self.runner.model_config.get_hidden_size()
 
+        index_paddings = []
         if self.runner.speculative_config:
-            index_paddings = self.runner.num_logits_paddings
-        else:
-            index_paddings = self.runner.num_reqs_paddings
+            index_paddings.extend(self.runner.num_logits_paddings)
+        index_paddings.extend(self.runner.num_reqs_paddings)
+        index_paddings = sorted(list(set(index_paddings)))
         dp_sharding = NamedSharding(self.runner.mesh,
                                     PartitionSpec(ShardingAxisName.ATTN_DATA))
         hidden_states_sharding = NamedSharding(
@@ -525,7 +582,11 @@ class CompilationManager:
     def _precompile_compute_logits(self) -> None:
         logger.info("Compiling compute_logits with different input shapes.")
         hsize = self.runner.model_config.get_hidden_size()
-        leading_shape = self.runner.num_reqs_paddings if not self.runner.speculative_config else self.runner.num_logits_paddings
+        leading_shape = []
+        if self.runner.speculative_config:
+            leading_shape.extend(self.runner.num_logits_paddings)
+        leading_shape.extend(self.runner.num_reqs_paddings)
+        leading_shape = sorted(list(set(leading_shape)))
         # Use PartitionSpec(ATTN_DATA, None) (2D explicit) to match the sharding
         # that _select_from_array_fn produces at inference time. shard_map with
         # out_specs=P('data') returns arrays with spec P('data', None); since
