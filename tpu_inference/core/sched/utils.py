@@ -31,6 +31,9 @@ def update_vllm_scheduler_for_exporting_expert_ids():
         def get_routed_experts(self, *args, **kwargs):
             return None
 
+    # Since we are reusing the upstream enable_return_routed_experts flag,
+    # we need to stub out the actual RoutedExpertsReader class which the
+    # upstream scheduler tries to create.
     RoutedExpertsReader.create = DummyRoutedExpertsReader.create
 
     original_update_from_output = Scheduler.update_from_output
