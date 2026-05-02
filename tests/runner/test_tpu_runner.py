@@ -33,8 +33,9 @@ def mock_unpack_arrays(blob, metadata):
     return {key: parts[i] for i, key in enumerate(metadata.keys)}
 
 
-@patch('tpu_inference.utils.DeviceBuffer.unpack_arrays',
-       new=mock_unpack_arrays)
+@patch(
+    'tpu_inference.runner.tpu_runner.common_utils.DeviceBuffer.unpack_arrays',
+    new=mock_unpack_arrays)
 class TestTPUJaxRunner:
 
     def setup_method(self):
@@ -206,8 +207,9 @@ class TestTPUJaxRunner:
         self.runner.use_hybrid_kvcache = True
 
 
-@patch('tpu_inference.utils.DeviceBuffer.unpack_arrays',
-       new=mock_unpack_arrays)
+@patch(
+    'tpu_inference.runner.tpu_runner.common_utils.DeviceBuffer.unpack_arrays',
+    new=mock_unpack_arrays)
 class TestTPUJaxRunnerMultimodalModelLoadedForTextOnly:
 
     def setup_method(self):
@@ -294,8 +296,9 @@ class TestTPUJaxRunnerMultimodalModelLoadedForTextOnly:
         self.runner.embed_input_ids_fn.assert_not_called()
 
 
-@patch('tpu_inference.utils.DeviceBuffer.unpack_arrays',
-       new=mock_unpack_arrays)
+@patch(
+    'tpu_inference.runner.tpu_runner.common_utils.DeviceBuffer.unpack_arrays',
+    new=mock_unpack_arrays)
 class TestTPUJaxRunnerDisableMM:
 
     def setup_method(self):

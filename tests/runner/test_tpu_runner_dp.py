@@ -30,8 +30,9 @@ def mock_unpack_arrays(blob, metadata):
     return {key: parts[i] for i, key in enumerate(metadata.keys)}
 
 
-@patch('tpu_inference.utils.DeviceBuffer.unpack_arrays',
-       new=mock_unpack_arrays)
+@patch(
+    'tpu_inference.runner.tpu_runner.common_utils.DeviceBuffer.unpack_arrays',
+    new=mock_unpack_arrays)
 class TestTPUJaxRunnerDPInputsLightweight:
 
     def setup_method(self):
