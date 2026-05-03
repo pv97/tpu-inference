@@ -184,7 +184,8 @@ class CompilationManager:
                     "unpack_arrays",
                     DeviceBuffer.unpack_arrays,
                     blob,
-                    metadata,
+                    metadata.keys,
+                    metadata.sizes,
                     num_tokens=num_tokens,
                     logits_padding=logits_padding,
                 )
