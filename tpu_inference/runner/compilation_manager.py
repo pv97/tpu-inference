@@ -162,6 +162,12 @@ class CompilationManager:
             logits_paddings.extend(self.runner.num_logits_paddings)
         logits_paddings.extend(self.runner.num_reqs_paddings)
         logits_paddings = sorted(list(set(logits_paddings)))
+
+        logger.info(
+            f"unpack_arrays num_tokens_paddings: {self.runner.num_tokens_paddings}"
+        )
+        logger.info(f"unpack_arrays logits_paddings: {logits_paddings}")
+
         for num_tokens in self.runner.num_tokens_paddings:
             for logits_padding in logits_paddings:
                 sizes = list(base_sizes)
@@ -535,11 +541,10 @@ class CompilationManager:
         logger.info("Compiling select_from_array with different input shapes.")
         hsize = self.runner.model_config.get_hidden_size()
 
-        index_paddings = []
         if self.runner.speculative_config:
-            index_paddings.extend(self.runner.num_logits_paddings)
-        index_paddings.extend(self.runner.num_reqs_paddings)
-        index_paddings = sorted(list(set(index_paddings)))
+            index_paddings = self.runner.num_logits_paddings
+        else:
+            index_paddings = self.runner.num_reqs_paddings
         dp_sharding = NamedSharding(self.runner.mesh,
                                     PartitionSpec(ShardingAxisName.ATTN_DATA))
         hidden_states_sharding = NamedSharding(
@@ -582,11 +587,7 @@ class CompilationManager:
     def _precompile_compute_logits(self) -> None:
         logger.info("Compiling compute_logits with different input shapes.")
         hsize = self.runner.model_config.get_hidden_size()
-        leading_shape = []
-        if self.runner.speculative_config:
-            leading_shape.extend(self.runner.num_logits_paddings)
-        leading_shape.extend(self.runner.num_reqs_paddings)
-        leading_shape = sorted(list(set(leading_shape)))
+        leading_shape = self.runner.num_reqs_paddings if not self.runner.speculative_config else self.runner.num_logits_paddings
         # Use PartitionSpec(ATTN_DATA, None) (2D explicit) to match the sharding
         # that _select_from_array_fn produces at inference time. shard_map with
         # out_specs=P('data') returns arrays with spec P('data', None); since

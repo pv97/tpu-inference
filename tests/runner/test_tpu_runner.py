@@ -28,8 +28,9 @@ from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
 def mock_unpack_arrays(blob, metadata):
+    blob_cpu = np.asarray(jax.device_get(blob))
     indices = tuple(np.cumsum(metadata.sizes)[:-1])
-    parts = np.split(blob, indices)
+    parts = np.split(blob_cpu, indices)
     return {key: parts[i] for i, key in enumerate(metadata.keys)}
 
 
