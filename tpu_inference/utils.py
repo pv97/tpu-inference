@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-import functools
 import time
 from collections import defaultdict
 from collections.abc import Sequence
@@ -489,7 +488,6 @@ class DeviceBuffer:
         self._sizes = []
 
     @staticmethod
-    @functools.partial(jax.jit, static_argnums=(1, ))
     def unpack_arrays(blob: jax.Array,
                       metadata: DeviceBufferMetadata) -> Dict[str, jax.Array]:
         """
