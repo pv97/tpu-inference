@@ -492,7 +492,6 @@ class DeviceBuffer:
                       metadata: DeviceBufferMetadata) -> Dict[str, jax.Array]:
         """
         Unpack a 1D blob into a dictionary of arrays based on provided metadata.
-        Uses JIT and jnp.split to minimize dispatch overhead.
         """
         indices = tuple(np.cumsum(metadata.sizes)[:-1])
         parts = jnp.split(blob, indices)
