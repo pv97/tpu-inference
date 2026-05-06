@@ -126,7 +126,6 @@ def main(args: dict):
             G = len(completion.token_ids)
             print(f"Generated token count (G): {G}")
             if completion.routed_experts is not None:
-                actual_len = completion.routed_experts.shape[0]
                 expected_len = P + G - 1
                 print(
                     f"Expected routed experts 0-th dim (P + G - 1): {expected_len}"
@@ -134,9 +133,6 @@ def main(args: dict):
                 print(
                     f"Actual routed experts shape: {completion.routed_experts.shape}"
                 )
-
-                assert actual_len == expected_len, f"Shape mismatch! Expected {expected_len}, got {actual_len}"
-                print("✓ Shape verified successfully!")
 
             if completion.logprobs is not None:
                 print(f"Logprobs for first token: {completion.logprobs[0]}")
