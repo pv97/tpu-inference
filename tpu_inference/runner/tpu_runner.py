@@ -842,8 +842,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # request_distribution[0] tracks the number of decode requests.
         is_decode_only = self.input_batch.request_distribution[
             0] == self.input_batch.num_reqs
-        enable_continue_decode = self.vllm_config.additional_config.get(
-            "enable_continue_decode", False)
+        enable_continue_decode = True
         if (is_decode_only and enable_continue_decode
                 and not self.scheduler_config.async_scheduling
                 and self.is_last_rank and not self.is_pooling_model):
