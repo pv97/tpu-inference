@@ -844,9 +844,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             0] == self.input_batch.num_reqs
         enable_continue_decode = self.vllm_config.additional_config.get(
             "enable_continue_decode", False)
-        if (is_decode_only and enable_continue_decode
-                and not self.scheduler_config.async_scheduling
-                and self.is_last_rank and not self.is_pooling_model):
+        if (is_decode_only and enable_continue_decode and self.is_last_rank
+                and not self.is_pooling_model):
             return self._execute_continue_decode(scheduler_output)
 
         # TODO(pooyam): I guess we can remove returning sampling_metadata in `_prepare_inputs` after https://github.com/njhill/vllm/commit/b7433ca1a47732394b1bdea4099d98389515954b
@@ -955,28 +954,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             expert_indices=expert_indices)
         return None
 
-    def _get_remaining_slots(self) -> np.ndarray:
-        # Iterate over all KV cache groups (e.g., for hybrid cache configurations)
-        # and conservatively calculate the minimum remaining token capacity.
-        min_remaining = None
-        for block_table in self.input_batch.block_table:
-            num_blocks = block_table.num_blocks_per_row[:self.input_batch.
-                                                        num_reqs]
-            block_size = self.block_size
-            num_tokens = self.input_batch.num_tokens[:self.input_batch.
-                                                     num_reqs]
-
-            allocated_capacity = num_blocks * block_size
-            remaining = allocated_capacity - num_tokens
-            if min_remaining is None:
-                min_remaining = remaining
-            else:
-                min_remaining = np.minimum(min_remaining, remaining)
-
-        if min_remaining is None:
-            return np.zeros(0, dtype=np.int32)
-        return min_remaining
-
     def _execute_continue_decode(
         self,
         scheduler_output: "VllmSchedulerOutput",
@@ -1019,17 +996,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if padding_token_id is None:
                 padding_token_id = 0
 
-        user_max_decode_steps = self.vllm_config.additional_config.get(
-            "max_decode_steps", 10)
-        remaining_slots = self._get_remaining_slots()
-        min_remaining = np.min(remaining_slots) if len(
-            remaining_slots) > 0 else 0
-
-        # Limit max_decode_steps to not cross block boundaries
-        max_decode_steps = min(user_max_decode_steps, min_remaining)
-
-        if max_decode_steps <= 0:
-            max_decode_steps = 1
+        # Max decode steps is now decided dynamically by the CPU scheduler,
+        # so we read the step count directly from scheduled tokens.
+        max_decode_steps = list(
+            scheduler_output.num_scheduled_tokens.values())[0]
 
         def loop_sample_fn(step_rng, logits):
             return sample(
@@ -1045,8 +1015,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "terminate_on_any_eos", False)
 
         # Pass max_decode_steps as a Python int to allow loop static bounds.
-        # This avoids nested JIT compilation overhead and runtime buffer OOM errors
-        # on tight HBM constraints, while still launching steps asynchronously (no sync).
+        # This avoids JIT control-flow OOMs on tight HBM limits.
         generated_tokens, final_kv_caches, final_state, final_rng, all_expert_indices = continue_decode(
             state=self.state,
             model_fn=self.model_fn,
@@ -1631,8 +1600,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         seq_lens_view = self.device_buffer.get_view((self.max_num_reqs, ),
                                                     key="seq_lens")
 
-        use_spec_decode = len(
-            scheduler_output.scheduled_spec_decode_tokens) > 0
+        enable_continue_decode = self.vllm_config.additional_config.get(
+            "enable_continue_decode", False)
+        use_spec_decode = (len(scheduler_output.scheduled_spec_decode_tokens)
+                           > 0 and not enable_continue_decode)
 
         if use_spec_decode:
             num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
@@ -1777,8 +1748,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         request_distribution = np.array(_request_distribution,
                                         dtype=np.int32).ravel()
 
-        use_spec_decode = len(
-            scheduler_output.scheduled_spec_decode_tokens) > 0
+        use_spec_decode = (len(scheduler_output.scheduled_spec_decode_tokens)
+                           > 0 and not enable_continue_decode)
         spec_decode_metadata = None
         if use_spec_decode:
             spec_decode_metadata = (
@@ -1979,8 +1950,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         input_ids_view = self.device_buffer.get_view(
             (padded_total_num_scheduled_tokens, ), key="input_ids")
 
-        use_spec_decode = len(
-            scheduler_output.scheduled_spec_decode_tokens) > 0
+        enable_continue_decode = self.vllm_config.additional_config.get(
+            "enable_continue_decode", False)
+        use_spec_decode = (len(scheduler_output.scheduled_spec_decode_tokens)
+                           > 0 and not enable_continue_decode)
 
         if use_spec_decode:
             num_draft_tokens = np.zeros(num_reqs, dtype=np.int32)
@@ -2079,8 +2052,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         positions = self.positions_cpu[:padded_total_num_scheduled_tokens]
         mrope_positions = self.mrope_positions_cpu[:, :
                                                    padded_total_num_scheduled_tokens]
-        use_spec_decode = len(
-            scheduler_output.scheduled_spec_decode_tokens) > 0
+        use_spec_decode = (len(scheduler_output.scheduled_spec_decode_tokens)
+                           > 0 and not enable_continue_decode)
         spec_decode_metadata = None
         if not use_spec_decode:
             logits_indices_view[:padded_num_reqs] = (

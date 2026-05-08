@@ -37,7 +37,7 @@ class PersistentBatchManager:
         self.is_last_rank = is_last_rank
 
     def _reorder_batch(self, scheduler_output: "VllmSchedulerOutput") -> int:
-        """ Reorder the sheduled requests to RPA kernel friendly distribution
+        """ Reorder the scheduled requests to RPA kernel friendly distribution
         (decode_only, fixed_chunked_prefill_only, mixed) and set the request
         distribution accordingly.
 
@@ -49,24 +49,34 @@ class PersistentBatchManager:
         swap_cnt = 0
         if num_reqs <= 0:
             return swap_cnt
-        # If total_num_scheduled_tokens == num_reqs, every request
-        # is scheduled for exactly 1 token (all decode). No reordering needed.
-        if scheduler_output.total_num_scheduled_tokens == num_reqs:
+
+        def is_decode(req_id: str) -> bool:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                return False
+            return req_state.num_computed_tokens >= req_state.num_prompt_tokens
+
+        # If all requests are decode, no reordering needed.
+        all_decode = all(
+            is_decode(req_id)
+            for req_id in self.input_batch.req_ids[:num_reqs])
+        if all_decode:
             num_decode = num_reqs
             self.input_batch.request_distribution = [
                 num_decode, num_decode, num_reqs
             ]
             return swap_cnt
+
         # Use two-pointer approach to reorder the decode requests to front.
         i, j = 0, num_reqs - 1
         while i < j:
             i_req_id = self.input_batch.req_ids[i]
             j_req_id = self.input_batch.req_ids[j]
 
-            if scheduler_output.num_scheduled_tokens[i_req_id] == 1:
+            if is_decode(i_req_id):
                 # i is a decode request, move to the next one.
                 i += 1
-            elif scheduler_output.num_scheduled_tokens[j_req_id] > 1:
+            elif not is_decode(j_req_id):
                 # j is a prefill request, move to the previous one.
                 j -= 1
             else:
@@ -76,8 +86,7 @@ class PersistentBatchManager:
                 j -= 1
                 swap_cnt += 1
 
-        num_decode = i + int(scheduler_output.num_scheduled_tokens[
-            self.input_batch.req_ids[i]] == 1)
+        num_decode = i + int(is_decode(self.input_batch.req_ids[i]))
 
         self.input_batch.request_distribution = [
             num_decode, num_decode, num_reqs

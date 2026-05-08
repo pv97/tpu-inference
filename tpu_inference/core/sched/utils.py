@@ -81,19 +81,41 @@ def patch_vllm_scheduler_for_continue_decode():
 
     # Avoid patching multiple times
     if not getattr(Scheduler, "_continue_decode_patched", False):
-        original_update_base = Scheduler._update_request_with_output
+        original_schedule = Scheduler.schedule
 
-        def patched_update_base(scheduler_self, request, new_token_ids):
-            # Call original first (which trims new_token_ids in-place if stopped)
-            res_token_ids, stopped = original_update_base(
-                scheduler_self, request, new_token_ids)
+        def patched_schedule(scheduler_self):
+            enable_continue_decode = scheduler_self.vllm_config.additional_config.get(
+                "enable_continue_decode", False)
+            is_pooling_model = scheduler_self.vllm_config.model_config.runner_type == "pooling"
 
-            # Update num_computed_tokens using the trimmed token length
-            diff = len(res_token_ids) - 1
-            if diff > 0:
-                request.num_computed_tokens += diff
+            if enable_continue_decode and not is_pooling_model:
+                user_max_decode_steps = scheduler_self.vllm_config.additional_config.get(
+                    "max_decode_steps", 10)
 
-            return res_token_ids, stopped
+                # Unconditionally fake placeholders for all active decode requests in running.
+                # vLLM's scheduler and speculative rollback natively handle all mixed-batch fallbacks!
+                for request in scheduler_self.running:
+                    is_request_decode = request.num_computed_tokens >= request.num_prompt_tokens
+                    if is_request_decode:
+                        if user_max_decode_steps > 1:
+                            request.spec_token_ids = [-1] * (
+                                user_max_decode_steps - 1)
+                        else:
+                            request.spec_token_ids = []
 
-        Scheduler._update_request_with_output = patched_update_base
+            # Call original schedule (natively handles block allocation & placeholder tracking)
+            scheduler_output = original_schedule(scheduler_self)
+
+            # Clear the fake spec_token_ids immediately to avoid side effects
+            for request in scheduler_self.running:
+                request.spec_token_ids = []
+
+            return scheduler_output
+
+        # Stub out make_spec_decoding_stats to prevent speculative metrics assertion crashes
+        def patched_make_stats(scheduler_self, *args, **kwargs):
+            return None
+
+        Scheduler.schedule = patched_schedule
+        Scheduler.make_spec_decoding_stats = patched_make_stats
         Scheduler._continue_decode_patched = True

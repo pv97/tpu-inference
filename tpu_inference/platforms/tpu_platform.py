@@ -296,13 +296,10 @@ class TpuPlatform(Platform):
         enable_continue_decode = vllm_config.additional_config.get(
             "enable_continue_decode", False)
         is_pooling_model = vllm_config.model_config.runner_type == "pooling"
-        async_scheduling = vllm_config.scheduler_config.async_scheduling
 
-        # continue_decode is only active for generative (non-pooling) models,
-        # and when async scheduling is disabled (to avoid KV cache desynchronization).
+        # continue_decode is active for generative (non-pooling) models
         should_use_continue_decode = (enable_continue_decode
-                                      and not is_pooling_model
-                                      and not async_scheduling)
+                                      and not is_pooling_model)
 
         # Late initialization to avoid circular import.
         from tpu_inference.core.sched.dp_scheduler import \

@@ -210,7 +210,6 @@ class TestTPUJaxRunner:
         runner.input_batch.num_tokens_no_spec = [10, 20]
         runner.input_batch.token_ids_cpu = np.zeros((8, 512), dtype=np.int32)
         runner.requests = {"req1": MagicMock(), "req2": MagicMock()}
-        runner._get_remaining_slots.return_value = np.array([30, 40])
         runner.vllm_config.additional_config = {
             "max_decode_steps": 5,
             "terminate_on_any_eos": False
@@ -247,9 +246,9 @@ class TestTPUJaxRunner:
 
         mock_device_get.side_effect = device_get_side_effect
 
-        # Setup scheduler output
+        # Setup scheduler output: max_decode_steps = 5 (pre-determined by CPU Scheduler)
         scheduler_output = MagicMock()
-        scheduler_output.num_scheduled_tokens = {"req1": 1, "req2": 1}
+        scheduler_output.num_scheduled_tokens = {"req1": 5, "req2": 5}
 
         runner._prepare_inputs.return_value = (
             np.zeros(8, dtype=np.int32),  # input_ids
@@ -301,12 +300,8 @@ class TestTPUJaxRunner:
             "req3": req_mock3
         }
 
-        # Setup remaining slots to check capping logic
-        # req1 has 15 slots left, req2 has 5 slots left, req3 has 20 slots left.
-        # min_remaining = 5. max_decode_steps should be capped at min(10, 5) = 5.
-        runner._get_remaining_slots.return_value = np.array([15, 5, 20])
         runner.vllm_config.additional_config = {
-            "max_decode_steps": 10,
+            "max_decode_steps": 5,
             "terminate_on_any_eos": True
         }
 
@@ -338,12 +333,12 @@ class TestTPUJaxRunner:
 
         mock_device_get.return_value = mock_tokens_cpu
 
-        # Setup scheduler output
+        # Setup scheduler output: max_decode_steps = 5 (pre-determined by CPU Scheduler)
         scheduler_output = MagicMock()
         scheduler_output.num_scheduled_tokens = {
-            "req1": 1,
-            "req2": 1,
-            "req3": 1
+            "req1": 5,
+            "req2": 5,
+            "req3": 5
         }
 
         # Mock attn_metadata.seq_lens_cpu
