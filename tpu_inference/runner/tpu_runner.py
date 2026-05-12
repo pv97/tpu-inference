@@ -1121,8 +1121,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.kv_caches = final_kv_caches
 
-        # Copy generated tokens back to CPU. We only need a single jax.device_get
-        # transfer here since step_counter is statically known (max_decode_steps).
+        # Copy generated tokens back to CPU.
         generated_tokens_cpu = np.asarray(jax.device_get(generated_tokens))
 
         # Expose request dimension as axis 0 after transpose: shape (batch_size, max_decode_steps)
@@ -1130,16 +1129,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         actual_steps = max_decode_steps
         if terminate_on_any_eos:
-            # Since the TPU loop does not terminate early (to avoid dynamic step sync),
-            # we enforce terminate_on_any_eos by scanning CPU output and finding
-            # the minimum step K at which any request hit EOS.
-            for i, req_id in enumerate(
-                    scheduler_output.num_scheduled_tokens.keys()):
-                req_idx = self.input_batch.req_id_to_index.get(req_id, i)
-                tokens = generated_tokens_cpu[req_idx]
-                eos_indices = np.where(tokens == eos_token_id)[0]
-                if len(eos_indices) > 0:
-                    actual_steps = min(actual_steps, eos_indices[0] + 1)
+            # The TPU loop terminates early via device sync when terminate_on_any_eos is True.
+            # We read the actual steps executed from final_state.step_counter.
+            actual_steps = int(jax.device_get(final_state.step_counter))
 
             # Slice the tokens to actual steps executed on CPU side
             generated_tokens_cpu = generated_tokens_cpu[:, :actual_steps]

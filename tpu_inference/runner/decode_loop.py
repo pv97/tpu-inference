@@ -63,7 +63,7 @@ def continue_decode(
     is_first_rank: bool = True,
     is_last_rank: bool = True,
     dp_size: int = 1,
-) -> tuple[jax.Array, Any, TpuSamplingState, jax.Array]:
+) -> tuple[jax.Array, Any, TpuSamplingState, jax.Array, Any]:
     """Continues decoding on TPU using a Python loop (no host sync during loop).
 
     Args:
@@ -77,7 +77,7 @@ def continue_decode(
         eos_token_id: EOS token ID.
         padding_token_id: Padding token ID.
         rng: Initial PRNG key for sampling.
-        terminate_on_any_eos: If True, stops as soon as any request hits EOS (handled on CPU).
+        terminate_on_any_eos: If True, stops as soon as any request hits EOS (triggers host sync).
                              If False, continues until all requests hit EOS.
         dp_size: Data parallel size (needed for correct metadata padding).
 
@@ -96,6 +96,7 @@ def continue_decode(
     current_rng = rng
 
     all_expert_indices = None
+    actual_steps = max_decode_steps
 
     for step_idx in range(max_decode_steps):
         # Split RNG for current step
@@ -134,6 +135,7 @@ def continue_decode(
 
         # 3. Check for EOS and update mask
         is_eos = next_tokens == eos_token_id
+        hit_eos_this_step = jnp.logical_and(active_mask, is_eos)
         new_active_mask = jnp.logical_and(active_mask, jnp.logical_not(is_eos))
 
         # 4. Update tokens for next step (pad finished ones)
@@ -171,11 +173,15 @@ def continue_decode(
         active_mask = new_active_mask
         attn_metadata = new_attn_metadata
 
+        if terminate_on_any_eos and jax.device_get(jnp.any(hit_eos_this_step)):
+            actual_steps = step_idx + 1
+            break
+
     final_state = TpuSamplingState(
         current_tokens=current_tokens,
         active_mask=active_mask,
         attn_metadata=attn_metadata,
-        step_counter=jnp.array(max_decode_steps, dtype=jnp.int32),
+        step_counter=jnp.array(actual_steps, dtype=jnp.int32),
     )
 
     return generated_tokens, kv_caches, final_state, current_rng, all_expert_indices
