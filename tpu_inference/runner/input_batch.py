@@ -83,6 +83,7 @@ class InputBatch:
             (max_num_reqs, ),
             dtype=np.int32,
         )
+        self.max_tokens_cpu = np.zeros(max_num_reqs, dtype=np.int32)
 
         # Block table.
         self.block_table = MultiGroupBlockTable(
@@ -259,6 +260,8 @@ class InputBatch:
             if top_k >= self.vocab_size:
                 top_k = -1
             self.top_k_cpu[req_index] = top_k
+            self.max_tokens_cpu[
+                req_index] = sampling_params.max_tokens or self.max_model_len
             if sampling_params.min_tokens:
                 self.min_tokens[req_index] = (
                     sampling_params.min_tokens,
@@ -336,6 +339,7 @@ class InputBatch:
         # `test_mamba_state_indices_no_duplicate_in_padded_tail`.
         self.mamba_state_indices_cpu[req_index] = 0
 
+        self.max_tokens_cpu[req_index] = 0
         self.greedy_reqs.discard(req_id)
         self.random_reqs.discard(req_id)
         self.spec_decode_unsupported_reqs.discard(req_id)
@@ -390,6 +394,8 @@ class InputBatch:
             self.top_p_cpu[i2], self.top_p_cpu[i1]
         self.top_k_cpu[i1], self.top_k_cpu[i2] =\
             self.top_k_cpu[i2], self.top_k_cpu[i1]
+        self.max_tokens_cpu[i1], self.max_tokens_cpu[i2] =\
+            self.max_tokens_cpu[i2], self.max_tokens_cpu[i1]
 
         self.token_ids_cpu[[i1, i2], :max_active_token_count] = \
             self.token_ids_cpu[[i2, i1], :max_active_token_count]
@@ -471,6 +477,8 @@ class InputBatch:
                 last_req_index]
             self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
             self.top_k_cpu[empty_index] = self.top_k_cpu[last_req_index]
+            self.max_tokens_cpu[empty_index] = self.max_tokens_cpu[
+                last_req_index]
             generator = self.generators.pop(last_req_index, None)
             if generator is not None:
                 self.generators[empty_index] = generator

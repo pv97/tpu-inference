@@ -139,6 +139,11 @@ def _scheduler_worker_process(
     original_scheduler_cls: type,
 ):
     """Worker process that manages a single scheduler instance."""
+    # Apply monkey-patches for continue decode in this process
+    from tpu_inference.core.sched.utils import \
+        patch_vllm_scheduler_for_continue_decode
+    patch_vllm_scheduler_for_continue_decode(vllm_config)
+
     # Initialize the scheduler in this process
     import inspect
     sig = inspect.signature(original_scheduler_cls)
@@ -495,6 +500,9 @@ class DPScheduler(SchedulerInterface):
             if gc_was_enabled:
                 gc.enable()
 
+            if isinstance(result, SchedulerWorkerError):
+                raise result
+
             end_time = time()
             total_time = end_time - start_time
             if total_time > 0.01:
@@ -634,6 +642,12 @@ class DPScheduler(SchedulerInterface):
     def _combine_scheduler_outputs(
             self, rank_outputs: List[SchedulerOutput]) -> DPSchedulerOutput:
         """Combine outputs from all DP rank schedulers into a unified output."""
+        for rank, output in enumerate(rank_outputs):
+            cached_reqs_len = len(output.scheduled_cached_reqs.req_ids
+                                  ) if output.scheduled_cached_reqs else 0
+            print(
+                f"DEBUG JETS: Rank {rank} output: total_tokens={output.total_num_scheduled_tokens}, new_reqs={len(output.scheduled_new_reqs)}, cached_reqs={cached_reqs_len}"
+            )
 
         # Combine new requests
         all_new_reqs = []
@@ -946,10 +960,11 @@ class DPScheduler(SchedulerInterface):
         req_id_to_token_range = {}
         if expert_indices is not None:
             current_token_offset = 0
-            for req_id, num_tokens_scheduled in scheduler_output.num_scheduled_tokens.items(
-            ):
+            for global_idx, req_id in enumerate(g.req_ids):
+                actual_len = len(g.sampled_token_ids[global_idx]
+                                 ) if g.sampled_token_ids else 0
                 start_idx = current_token_offset
-                end_idx = start_idx + num_tokens_scheduled
+                end_idx = start_idx + actual_len
                 current_token_offset = end_idx
                 req_id_to_token_range[req_id] = (start_idx, end_idx)
 
@@ -980,6 +995,9 @@ class DPScheduler(SchedulerInterface):
                 } if g.num_nans_in_logits else None),
                 kv_connector_output=g.kv_connector_output,
             )
+
+            if hasattr(g, "actual_steps"):
+                rank_model_runner_output.actual_steps = g.actual_steps
 
             if expert_indices is not None:
                 rank_expert_indices = []

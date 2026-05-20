@@ -20,6 +20,9 @@ import jax
 import jax.numpy as jnp
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 @functools.partial(
@@ -29,6 +32,7 @@ from tpu_inference.layers.common.attention_metadata import AttentionMetadata
         "active_mask",
         "attn_metadata",
         "step_counter",
+        "remaining_steps",
     ],
     meta_fields=[],
 )
@@ -42,6 +46,8 @@ class TpuSamplingState:
     attn_metadata: AttentionMetadata
     # scalar
     step_counter: jax.Array
+    # (batch_size,)
+    remaining_steps: jax.Array
 
 
 @functools.partial(
@@ -50,23 +56,46 @@ class TpuSamplingState:
 def _update_loop_state(
     next_tokens: jax.Array,
     active_mask: jax.Array,
+    remaining_steps: jax.Array,
     input_positions: jax.Array,
     seq_lens: jax.Array,
     eos_token_id: tuple[int, ...],
     padding_token_id: int,
     dp_size: int,
     pad_len: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array,
+           jax.Array]:
     eos_arr = jnp.atleast_1d(jnp.array(eos_token_id, dtype=jnp.int32))
     is_eos = jnp.any(next_tokens[:, None] == eos_arr[None, :], axis=-1)
-    new_active_mask = jnp.logical_and(active_mask, jnp.logical_not(is_eos))
+
+    # Reshape to 2D DP structure to handle padding alignment
+    active_mask_2d = active_mask.reshape(dp_size, -1)
+    remaining_steps_2d = remaining_steps.reshape(dp_size, -1)
+    seq_lens_2d = seq_lens.reshape(dp_size, -1)
+
+    if pad_len > 0:
+        padded_active_mask_2d = jnp.pad(active_mask_2d, ((0, 0), (0, pad_len)))
+    else:
+        padded_active_mask_2d = active_mask_2d[:, :remaining_steps_2d.shape[1]]
+
+    # Subtract usage only for active slots
+    new_remaining_steps_2d = jnp.maximum(
+        0, remaining_steps_2d - padded_active_mask_2d.astype(jnp.int32))
+    new_remaining_steps = new_remaining_steps_2d.ravel()
+
+    # Slice back to active shape to check for termination
+    active_len = active_mask_2d.shape[1]
+    out_of_steps_active = (new_remaining_steps_2d[:, :active_len] == 0).ravel()
+
+    new_active_mask = jnp.logical_and(
+        active_mask,
+        jnp.logical_not(jnp.logical_or(is_eos, out_of_steps_active)))
     next_input_ids = jnp.where(new_active_mask, next_tokens, padding_token_id)
     increment = new_active_mask.astype(jnp.int32)
     new_positions = input_positions + increment
 
-    # Fix DP padding bug by exposing DP dimension as 2D before padding
+    # Update seq_lens using the same DP padding
     increment_2d = increment.reshape(dp_size, -1)
-    seq_lens_2d = seq_lens.reshape(dp_size, -1)
     if pad_len > 0:
         padded_increment_2d = jnp.pad(increment_2d, ((0, 0), (0, pad_len)))
     else:
@@ -78,13 +107,13 @@ def _update_loop_state(
 
     any_hit_eos = jnp.any(jnp.logical_and(active_mask, is_eos))
 
-    return new_active_mask, next_input_ids, new_positions, new_seq_lens, step_record_tokens, any_hit_eos
+    return new_active_mask, new_remaining_steps, next_input_ids, new_positions, new_seq_lens, step_record_tokens, any_hit_eos
 
 
-@functools.partial(jax.jit, static_argnums=(1, 2))
-def _split_rngs(rng, static_size, dynamic_size):
+@functools.partial(jax.jit, static_argnums=(1, ))
+def _split_rngs(rng, static_size):
     all_rngs = jax.random.split(rng, static_size + 1)
-    return all_rngs[:dynamic_size], all_rngs[dynamic_size]
+    return all_rngs[:-1], all_rngs[-1]
 
 
 def continue_decode(
@@ -108,7 +137,7 @@ def continue_decode(
     is_last_rank: bool = True,
     dp_size: int = 1,
 ) -> tuple[list[jax.Array], Any, TpuSamplingState, jax.Array, list[jax.Array]
-           | None]:
+           | None, int]:
     """Helper function to run the decode loop on TPU.
 
     Args:
@@ -143,9 +172,10 @@ def continue_decode(
 
     current_tokens = init_state.current_tokens
     active_mask = init_state.active_mask
+    remaining_steps = init_state.remaining_steps
+    initial_active_reqs = int(jnp.sum(active_mask))
     attn_metadata = init_state.attn_metadata
-    step_rngs, current_rng = _split_rngs(rng, static_max_decode_steps,
-                                         max_decode_steps)
+    step_rngs, current_rng = _split_rngs(rng, static_max_decode_steps)
 
     token_list = []
     expert_indices_list = []
@@ -178,9 +208,10 @@ def continue_decode(
         next_tokens, _ = sample_fn(step_rng, logits)
 
         # 3. Update loop state via fused JIT helper
-        new_active_mask, next_input_ids, new_positions, new_seq_lens, step_record_tokens, any_hit_eos = _update_loop_state(
+        new_active_mask, new_remaining_steps, next_input_ids, new_positions, new_seq_lens, step_record_tokens, any_hit_eos = _update_loop_state(
             next_tokens,
             active_mask,
+            remaining_steps,
             attn_metadata.input_positions,
             attn_metadata.seq_lens,
             eos_token_id,
@@ -204,14 +235,19 @@ def continue_decode(
         # Update loop variables
         current_tokens = next_input_ids
         active_mask = new_active_mask
+        remaining_steps = new_remaining_steps
         attn_metadata = new_attn_metadata
 
         if terminate_on_any_eos and bool(any_hit_eos):
             actual_steps = step_idx + 1
+            termination_reason = "EOS"
             break
     else:
         actual_steps = max_decode_steps
+        termination_reason = "max_steps"
 
+    logger.info(f"actual steps: {actual_steps}, reason: {termination_reason}, "
+                f"initial_active_reqs: {initial_active_reqs}")
     generated_tokens = token_list
     all_expert_indices = expert_indices_list if expert_indices_list else None
 
@@ -220,6 +256,7 @@ def continue_decode(
         active_mask=active_mask,
         attn_metadata=attn_metadata,
         step_counter=jnp.array(actual_steps, dtype=jnp.int32),
+        remaining_steps=remaining_steps,
     )
 
-    return generated_tokens, kv_caches, final_state, current_rng, all_expert_indices
+    return generated_tokens, kv_caches, final_state, current_rng, all_expert_indices, actual_steps

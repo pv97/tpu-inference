@@ -571,7 +571,7 @@ class CompilationManager:
                 self._run_compilation(
                     f"worker{self.runner.rank} compute_logits",
                     self.runner.compute_logits_fn,
-                    self.runner.state,
+                    self.runner.state_leaves,
                     hidden_states,
                     lora_metadata,
                     num_reqs=num_reqs,

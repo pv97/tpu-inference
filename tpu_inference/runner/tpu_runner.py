@@ -332,13 +332,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.is_pooling_model: bool = self.model_config.runner_type == "pooling"
         """Generative model or pooling model select different computations."""
-        self.enable_continue_decode = (
-            self.vllm_config.additional_config.get("enable_continue_decode",
-                                                   False)
-            and not self.scheduler_config.async_scheduling
-            and (self.parallel_config is None
-                 or self.parallel_config.pipeline_parallel_size == 1)
-            and not self.is_pooling_model)
+        self.enable_continue_decode = (self.vllm_config.additional_config.get(
+            "enable_continue_decode", False))
+        print(
+            f"DEBUG JETS: TPUModelRunner initialized with enable_continue_decode={self.enable_continue_decode}"
+        )
         eos_token_id = runner_utils.get_eos_token_id(self.model_config)
         if isinstance(eos_token_id, int):
             self.eos_token_id = (eos_token_id, )
@@ -905,6 +903,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         scheduler_output: "VllmSchedulerOutput",
         intermediate_tensors: Optional[JaxIntermediateTensors] = None,
     ) -> JaxIntermediateTensors | ModelRunnerOutput | None:
+        print(
+            f"DEBUG JETS: scheduler_output: total_tokens={scheduler_output.total_num_scheduled_tokens}, new_reqs={len(scheduler_output.scheduled_new_reqs)}, cached_reqs={len(scheduler_output.scheduled_cached_reqs.req_ids)}"
+        )
+        print(
+            f"DEBUG JETS: input_batch before update: num_reqs={self.input_batch.num_reqs}, dist={self.input_batch.request_distribution}"
+        )
         self.persistent_batch_manager.update_states(
             scheduler_output, self.get_mrope_input_positions_fn)
         if not scheduler_output.total_num_scheduled_tokens:
@@ -928,6 +932,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # request_distribution[0] tracks the number of decode requests.
         is_decode_only = self.input_batch.request_distribution[
             0] == self.input_batch.num_reqs
+        print(
+            f"DEBUG JETS: enable_continue_decode={self.enable_continue_decode}, is_decode_only={is_decode_only}"
+        )
         if is_decode_only and self.enable_continue_decode:
             return self._execute_continue_decode(scheduler_output)
 
@@ -941,6 +948,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             spec_decode_metadata,
             logits_indices_selector,
             padded_num_reqs,
+            _remaining_steps,
         ) = self._prepare_inputs(scheduler_output)
 
         # multi-modal support
@@ -1083,6 +1091,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             spec_decode_metadata,
             logits_indices_selector,
             padded_num_reqs,
+            remaining_steps,
         ) = self._prepare_inputs(scheduler_output)
 
         init_tokens = input_ids
@@ -1097,16 +1106,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             active_mask=active_mask,
             attn_metadata=attn_metadata,
             step_counter=self.zero_array,
+            remaining_steps=remaining_steps,
         )
 
         from tpu_inference.layers.jax.sample.sampling import sample
 
         user_max_decode_steps = self.vllm_config.additional_config.get(
             "max_decode_steps", 10)
-        min_remaining = self._get_min_remaining_slots()
 
-        # Limit max_decode_steps to not cross block boundaries
-        max_decode_steps = min(user_max_decode_steps, min_remaining)
+        # Calculate max_remaining steps based on scheduled tokens
+        if scheduler_output.num_scheduled_tokens:
+            max_remaining = max(scheduler_output.num_scheduled_tokens.values())
+        else:
+            max_remaining = 0
+
+        max_decode_steps = min(user_max_decode_steps, max_remaining)
 
         if max_decode_steps <= 0:
             max_decode_steps = 1
@@ -1127,7 +1141,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Pass max_decode_steps as a Python int to allow loop static bounds.
         # This avoids nested JIT compilation overhead and runtime buffer OOM errors
         # on tight HBM constraints, while still launching steps asynchronously (no sync).
-        generated_tokens, final_kv_caches, final_state, final_rng, all_expert_indices = continue_decode(
+        generated_tokens, final_kv_caches, final_state, final_rng, all_expert_indices, actual_steps = continue_decode(
             state=self.state_leaves,
             model_fn=self.model_fn,
             compute_logits_fn=self.compute_logits_fn,
@@ -1195,9 +1209,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             actual_len = len(valid_tokens)
             sampled_token_ids.append(valid_tokens)
 
-            # 2. Update scheduler_output directly to the true trimmed length
-            scheduler_output.num_scheduled_tokens[req_id] = actual_len
-
             # 3. Extract exact valid expert indices for this request
             if all_expert_indices_cpu is not None:
                 # Slice to (actual_len, layers, top_k)
@@ -1234,6 +1245,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             prompt_logprobs_dict={},
             pooler_output=[],
         )
+        output.actual_steps = actual_steps
 
         if expert_indices_cpu is not None:
             output.expert_indices = expert_indices_cpu
@@ -1701,6 +1713,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             (self.max_num_reqs + dp_size, ), key="query_start_loc")
         seq_lens_view = self.device_buffer.get_view((self.max_num_reqs, ),
                                                     key="seq_lens")
+        remaining_steps_view = self.device_buffer.get_view(
+            (self.max_num_reqs, ), key="remaining_steps")
 
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
@@ -1780,6 +1794,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 dp_rank + 1]
             seq_lens_cpu = seq_lens_view[req_offset:req_offset +
                                          max_num_reqs_per_dp_rank]
+            remaining_steps_cpu = remaining_steps_view[
+                req_offset:req_offset + max_num_reqs_per_dp_rank]
             _num_reqs = num_req_per_dp_rank[dp_rank]
             req_indices = req_indices_dp[dp_rank]
             num_scheduled_tokens_per_req = scheduled_tokens_per_dp_rank[
@@ -1788,10 +1804,11 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if _num_reqs == 0:
                 query_start_loc_cpu[:] = 0
                 seq_lens_cpu[:] = 0
+                remaining_steps_cpu[:] = 0
                 continue
 
             # After buffer.reset(), the buffer is still dirty, so we need to zero
-            # Out the starting index.
+            # out the starting index.
             query_start_loc_cpu[0] = 0
             np.cumsum(
                 num_scheduled_tokens_per_req,
@@ -1803,6 +1820,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 self.input_batch.num_computed_tokens_cpu[req_indices] +
                 num_scheduled_tokens_per_req)
             seq_lens_cpu[_num_reqs:] = 0
+
+            remaining_steps_cpu[:_num_reqs] = num_scheduled_tokens_per_req
+            remaining_steps_cpu[_num_reqs:] = 0
 
         # populate logits_indices
         for dp_rank in range(dp_size):
@@ -1838,7 +1858,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # Count decode requests (those with num_scheduled_tokens == 1) in this DP rank
             num_decode_in_dp_rank = 0
             for req_id in req_ids_dp[dp_rank]:
-                if scheduler_output.num_scheduled_tokens[req_id] == 1:
+                if self.persistent_batch_manager._is_decode(
+                        req_id, scheduler_output):
                     num_decode_in_dp_rank += 1
             _request_distribution.append(
                 [num_decode_in_dp_rank, num_decode_in_dp_rank, _num_reqs])
@@ -1943,6 +1964,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         query_start_loc = metadata["query_start_loc"]
         seq_lens = metadata["seq_lens"]
         logits_indices = metadata["logits_indices"]
+        remaining_steps = metadata["remaining_steps"]
 
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
@@ -2016,6 +2038,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             spec_decode_metadata,
             logits_indices_selector,
             padded_num_reqs,
+            remaining_steps,
         )
 
     def _get_input_ids_embeds(self, input_ids: jax.Array,

@@ -36,6 +36,17 @@ class PersistentBatchManager:
         self.model_config = model_config
         self.is_last_rank = is_last_rank
 
+    def _is_decode(self, req_id: str,
+                   scheduler_output: "VllmSchedulerOutput") -> bool:
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return scheduler_output.num_scheduled_tokens.get(req_id, 1) == 1
+
+        if scheduler_output.num_scheduled_tokens.get(req_id, 1) == 1:
+            return True
+
+        return req_state.num_computed_tokens >= req_state.num_prompt_tokens
+
     def _reorder_batch(self, scheduler_output: "VllmSchedulerOutput") -> int:
         """ Reorder the sheduled requests to RPA kernel friendly distribution
         (decode_only, fixed_chunked_prefill_only, mixed) and set the request
@@ -63,10 +74,10 @@ class PersistentBatchManager:
             i_req_id = self.input_batch.req_ids[i]
             j_req_id = self.input_batch.req_ids[j]
 
-            if scheduler_output.num_scheduled_tokens[i_req_id] == 1:
+            if self._is_decode(i_req_id, scheduler_output):
                 # i is a decode request, move to the next one.
                 i += 1
-            elif scheduler_output.num_scheduled_tokens[j_req_id] > 1:
+            elif not self._is_decode(j_req_id, scheduler_output):
                 # j is a prefill request, move to the previous one.
                 j -= 1
             else:
@@ -76,8 +87,8 @@ class PersistentBatchManager:
                 j -= 1
                 swap_cnt += 1
 
-        num_decode = i + int(scheduler_output.num_scheduled_tokens[
-            self.input_batch.req_ids[i]] == 1)
+        num_decode = i + int(
+            self._is_decode(self.input_batch.req_ids[i], scheduler_output))
 
         self.input_batch.request_distribution = [
             num_decode, num_decode, num_reqs
