@@ -681,6 +681,9 @@ class PhasedBasedProfiler:
             # DP ranks land in the same <phase>/plugins/profile/<ts>/ dir
             # when capture is moved out of the sandbox.
             self._canonical_dst_ts = self._resolve_canonical_dst_ts(phase_dir)
+            if hasattr(self, "default_profiling_options"
+                       ) and self.default_profiling_options:
+                self.default_profiling_options.session_id = self._canonical_dst_ts
 
             self.profile_dir_with_phase_suffix = os.path.join(
                 phase_dir, f"dp_rank_{self.worker_rank}")
@@ -718,6 +721,17 @@ class PhasedBasedProfiler:
                 batch_composition_stats)
             self.profiling_n_steps_left -= 1
             if self.profiling_n_steps_left <= 0:
+                try:
+                    import jax.numpy as jnp
+                    import jax.sharding as xs
+                    if hasattr(self, "mesh") and self.mesh is not None:
+                        sharding = xs.NamedSharding(self.mesh,
+                                                    xs.PartitionSpec())
+                        jax.device_put(jnp.zeros((1, )),
+                                       sharding).block_until_ready()
+                except Exception as e:
+                    logger.warning(
+                        "Failed to block on TPU mesh before stop_trace: %s", e)
                 jax.profiler.stop_trace()
                 self._merge_profile_directories()
                 logger.info(

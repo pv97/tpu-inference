@@ -1024,10 +1024,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             req_id_kwargs = runner_utils.extract_request_ids_for_tracing(
                 self.input_batch, scheduler_output)
 
-        with jax.set_mesh(self.mesh), jax.profiler.TraceAnnotation(
-                f"execute_model: {reqs} reqs, {toks} toks", **req_id_kwargs):
-            output = self._execute_model(scheduler_output,
-                                         intermediate_tensors)
+        with jax.set_mesh(self.mesh), jax.profiler.StepTraceAnnotation(
+                "execute_model", step_num=self.batch_counter):
+            with jax.profiler.TraceAnnotation(
+                    f"execute_model: {reqs} reqs, {toks} toks",
+                    **req_id_kwargs):
+                output = self._execute_model(scheduler_output,
+                                             intermediate_tensors)
         return output
 
     def sample_tokens(
