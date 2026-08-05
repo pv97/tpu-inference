@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-    KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole)
+    KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole, SupportsHMA)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import \
     KVConnectorStats
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -206,7 +206,7 @@ class RaidenRequestTracker:
         self.is_decode_phase = False
 
 
-class RaidenOffloadConnector(KVConnectorBase_V1):
+class RaidenOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     """Manages KV cache offloading via Raiden libraries."""
 
     def __init__(
@@ -266,6 +266,15 @@ class RaidenOffloadConnector(KVConnectorBase_V1):
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished_all_groups(
+            request, block_ids)
 
     def register_runner(self, runner: "TPUModelRunner") -> None:
         assert self.connector_worker is not None
@@ -591,6 +600,14 @@ class RaidenOffloadConnectorScheduler:
             self.kv_store.release(raiden_hashes)
         return False, None
 
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, Optional[dict[str, Any]]]:
+        return self.request_finished(request,
+                                     block_ids[0] if block_ids else [])
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         if connector_output.kv_connector_stats and connector_output.kv_connector_stats.data is not None:
             stats = connector_output.kv_connector_stats
@@ -672,11 +689,18 @@ class RaidenOffloadConnectorWorker:
         if not kv_caches:
             raise ValueError("No KV caches registered in Runner.")
 
+        flat_kv_caches = []
+        for c in kv_caches:
+            if isinstance(c, (list, tuple)):
+                flat_kv_caches.extend(c)
+            else:
+                flat_kv_caches.append(c)
+
         logger.info(
             f"Initializing Raiden KVCacheManager on worker. host_blocks_to_allocate={self.num_cpu_chunks}, block_size={self.block_size}"
         )
         self.raiden_manager = RaidenKVCacheManager(
-            kv_caches=kv_caches,
+            kv_caches=flat_kv_caches,
             local_control_port=0,
             host_blocks_to_allocate=self.num_cpu_chunks,
             unsafe_skip_buffer_lock=True)

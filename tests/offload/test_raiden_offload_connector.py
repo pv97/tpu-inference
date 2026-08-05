@@ -447,5 +447,60 @@ def test_worker_get_finished_unlocks_on_save_failure():
     assert "req_fail" not in worker.offload_stats.data["finished_save_chunks"]
 
 
+def test_raiden_connector_supports_hma_and_hybrid_models():
+    """Verify that RaidenOffloadConnector supports HMA and initializes hybrid model KV cache configs without error."""
+    import torch
+    from vllm.config.kv_transfer import KVTransferConfig
+    from vllm.distributed.kv_transfer.kv_connector.factory import \
+        KVConnectorFactory
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.v1.core.kv_cache_utils import (SlidingWindowSpec,
+                                             get_kv_cache_configs)
+
+    kv_transfer_config = KVTransferConfig(
+        kv_connector="RaidenOffloadConnector",
+        kv_connector_module_path=
+        "tpu_inference.offload.raiden_offload_connector",
+        kv_role="kv_both",
+    )
+
+    # 1. Verify RaidenOffloadConnector supports HMA
+    assert KVConnectorFactory.supports_hma_config(kv_transfer_config)
+
+    engine_args = EngineArgs(
+        model="Qwen/Qwen3.5-397B-A17B-FP8",
+        kv_transfer_config=kv_transfer_config,
+    )
+    vllm_config = engine_args.create_engine_config()
+
+    # 2. Verify HMA is NOT auto-disabled
+    assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False
+
+    worker_kv_cache_specs = [{
+        "layer.0":
+        SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.float16,
+            sliding_window=1024,
+        ),
+        "layer.1":
+        SlidingWindowSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.float16,
+            sliding_window=2048,
+        ),
+    }]
+
+    # 3. Verify get_kv_cache_configs succeeds for hybrid model specs
+    configs = get_kv_cache_configs(vllm_config,
+                                   worker_kv_cache_specs,
+                                   available_memory=[1024 * 1024 * 1024])
+    assert configs is not None
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
