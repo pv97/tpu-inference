@@ -689,22 +689,29 @@ class RaidenOffloadConnectorWorker:
         if not kv_caches:
             raise ValueError("No KV caches registered in Runner.")
 
-        flat_kv_caches = []
-        for c in kv_caches:
-            if isinstance(c, (list, tuple)):
-                flat_kv_caches.extend(c)
-            else:
-                flat_kv_caches.append(c)
+        # Extract only block-paged attention KV cache arrays (excluding non-paged state tuples like Mamba/SSM)
+        attn_kv_caches = [
+            c for c in kv_caches if not isinstance(c, (list, tuple))
+        ]
+        if not attn_kv_caches:
+            raise ValueError(
+                "RaidenOffloadConnector requires at least one block-paged Attention KV cache layer. "
+                "Pure Mamba/SSM recurrent states cannot be block-offloaded.")
 
         logger.info(
-            f"Initializing Raiden KVCacheManager on worker. host_blocks_to_allocate={self.num_cpu_chunks}, block_size={self.block_size}"
+            f"Initializing Raiden KVCacheManager on worker for {len(attn_kv_caches)} attention KV cache layers. host_blocks_to_allocate={self.num_cpu_chunks}, block_size={self.block_size}"
         )
-        self.raiden_manager = RaidenKVCacheManager(
-            kv_caches=flat_kv_caches,
-            local_control_port=0,
-            host_blocks_to_allocate=self.num_cpu_chunks,
-            unsafe_skip_buffer_lock=True)
-        logger.info("Raiden Worker: C++ KVCacheManager Initialized.")
+        try:
+            self.raiden_manager = RaidenKVCacheManager(
+                kv_caches=attn_kv_caches,
+                local_control_port=0,
+                host_blocks_to_allocate=self.num_cpu_chunks,
+                unsafe_skip_buffer_lock=True)
+            logger.info("Raiden Worker: C++ KVCacheManager Initialized.")
+        except Exception as e:
+            logger.error(f"Failed to initialize RaidenKVCacheManager: {e}",
+                         exc_info=True)
+            raise
 
     def start_load_kv(self, fwd_ctx: "ForwardContext"):
         if not self.raiden_manager:
