@@ -1254,6 +1254,23 @@ class TestDPScheduler:
                                       np.array([1, 2, 6]))
         assert sliced.cu_num_generated_tokens == [0, 2, 3]
 
+    def test_slice_logprobs_with_none_ranks(self, mock_vllm_config,
+                                            mock_kv_cache_config,
+                                            mock_structured_output_manager):
+        """Test _slice_logprobs handles None gracefully."""
+        logprobs = LogprobsLists(
+            logprob_token_ids=np.array([[10, 20], [30, 40]]),
+            logprobs=np.array([[0.1, 0.2], [0.3, 0.4]]),
+            sampled_token_ranks=None,
+            cu_num_generated_tokens=[0, 1],
+        )
+
+        sliced = DPScheduler._slice_logprobs(logprobs, [1])
+        np.testing.assert_array_equal(sliced.logprob_token_ids,
+                                      np.array([[30, 40]]))
+        assert sliced.sampled_token_ranks is None
+        assert sliced.cu_num_generated_tokens == [0, 1]
+
     def test_shutdown(self, mock_vllm_config, mock_kv_cache_config,
                       mock_structured_output_manager):
         """Test shutdown sends SHUTDOWN command to all workers."""

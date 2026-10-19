@@ -230,6 +230,7 @@ def _process_continue_decode_outputs(
     max_model_len: int = 0,
     attn_metadata: Optional[Any] = None,
     is_async: bool = False,
+    block_ids_by_req: Optional[Dict[str, List[int]]] = None,
 ) -> Tuple[List[List[int]], Optional[Any], List[RoutedExpertsStepEntry], int,
            int]:
     """Process continue_decode TPU outputs into CPU data structures.
@@ -297,9 +298,12 @@ def _process_continue_decode_outputs(
         requests, "get") else None
     chunk_start: Dict[str, int] = {}
     if all_expert_indices_cpu is not None and scheduler_output is not None:
+        for new_req in getattr(scheduler_output, "scheduled_new_reqs",
+                               None) or ():
+            chunk_start[new_req.req_id] = new_req.num_computed_tokens
         cached_reqs = scheduler_output.scheduled_cached_reqs
         if cached_reqs is not None:
-            chunk_start = dict(
+            chunk_start.update(
                 zip(cached_reqs.req_ids, cached_reqs.num_computed_tokens))
 
     for req_idx, req_id in enumerate(req_ids):
@@ -318,21 +322,6 @@ def _process_continue_decode_outputs(
             if not is_async:
                 req_state.output_token_ids.extend(valid_tokens)
 
-            if all_expert_indices_cpu is not None and actual_len > 0:
-                # The on-device burst is not yet reflected in
-                # num_computed_tokens, so it starts right there.
-                routed_experts_entries.append(
-                    RoutedExpertsStepEntry(
-                        req_id=req_id,
-                        rows=all_expert_indices_cpu[:actual_len, :,
-                                                    req_idx, :],
-                        token_start=chunk_start.get(
-                            req_id, req_state.num_computed_tokens),
-                        num_accepted=actual_len,
-                        block_ids=_block_ids_for_group(
-                            req_state, routed_experts_attn_gid),
-                        dp_rank=dp_rank_by_req.get(req_id, 0),
-                    ))
             if input_batch is not None:
                 start_idx = input_batch.num_tokens_no_spec[req_idx]
                 end_idx = start_idx + actual_len
@@ -341,6 +330,30 @@ def _process_continue_decode_outputs(
                                               start_idx:end_idx] = valid_tokens
                     input_batch.num_tokens_no_spec[req_idx] = end_idx
                     input_batch.num_tokens[req_idx] = end_idx
+
+        if (all_expert_indices_cpu is not None and enable_return_routed_experts
+                and actual_len > 0
+                and (req_state is not None or block_ids_by_req is not None)):
+            # The on-device burst is not yet reflected in
+            # num_computed_tokens, so it starts right there.
+            block_ids = (
+                block_ids_by_req[req_id] if block_ids_by_req is not None
+                and req_id in block_ids_by_req else
+                (_block_ids_for_group(req_state, routed_experts_attn_gid)
+                 if req_state is not None else []))
+            token_start = chunk_start.get(
+                req_id,
+                req_state.num_computed_tokens if req_state is not None else 0,
+            )
+            routed_experts_entries.append(
+                RoutedExpertsStepEntry(
+                    req_id=req_id,
+                    rows=all_expert_indices_cpu[:actual_len, :, req_idx, :],
+                    token_start=token_start,
+                    num_accepted=actual_len,
+                    block_ids=block_ids,
+                    dp_rank=dp_rank_by_req.get(req_id, 0),
+                ))
 
         if (attn_metadata is not None
                 and hasattr(attn_metadata, "seq_lens_cpu")
@@ -413,11 +426,13 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         # requests by the time `get_output` runs.
         self._routed_experts_block_ids = routed_experts_block_ids or {}
         self._runner = runner
+        self._eos_token_id = getattr(runner, "eos_token_id", 0)
         self._is_continue_decode = False
         self._actual_steps_future = None
+        self._resolved = False
 
     def _get_continue_decode_output(self) -> ModelRunnerOutput:
-        if self._model_runner_output.sampled_token_ids:
+        if self._resolved or self._model_runner_output.sampled_token_ids:
             return self._model_runner_output
 
         aux_output_worker = getattr(self._runner, "aux_output_worker", None)
@@ -431,7 +446,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             generated_tokens=self._next_tokens,
             actual_steps=self._actual_steps_future,
             req_ids=self._model_runner_output.req_ids,
-            eos_token_id=self._runner.eos_token_id if self._runner else 0,
+            eos_token_id=self._eos_token_id,
             indices_selector=self.logits_indices_selector,
             logprobs_tensors=self._logprobs_tensors,
             expert_indices=self._expert_indices,
@@ -443,6 +458,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
                                    None),
             scheduler_output=self._scheduler_output,
             is_async=True,
+            block_ids_by_req=self._routed_experts_block_ids,
         )
 
         _log_continue_decode_summary(
@@ -464,11 +480,17 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
                 aux_output_worker.process_step(
                     self._model_runner_output.req_ids, routed_experts_entries))
 
+        self._resolved = True
+        if (self._runner is not None and getattr(
+                self._runner, "_pending_async_output", None) is self):
+            self._runner._pending_async_output = None
         return self._model_runner_output
 
     def get_output(self) -> ModelRunnerOutput:
         if getattr(self, "_is_continue_decode", False):
             return self._get_continue_decode_output()
+        if self._resolved or self._model_runner_output.sampled_token_ids:
+            return self._model_runner_output
 
         valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(
             self._runner, self._spec_decode_metadata, self._next_tokens,
@@ -512,6 +534,10 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
                 aux_output_worker.process_step(
                     self._model_runner_output.req_ids, entries))
 
+        self._resolved = True
+        if (self._runner is not None and getattr(
+                self._runner, "_pending_async_output", None) is self):
+            self._runner._pending_async_output = None
         return self._model_runner_output
 
 
@@ -850,6 +876,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self._substitute_placeholder_token_fn = _substitute_placeholder_token
         self.execute_model_state: ExecuteModelState | None = None
         self._continue_decode_output = None
+        self._pending_async_output: AsyncTPUModelRunnerOutput | None = None
         self.batch_counter = 0
 
         self.kv_caches: list[jax.Array] = []
@@ -1682,8 +1709,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         self.persistent_batch_manager.update_states(
             scheduler_output, self.get_mrope_input_positions_fn)
         if self.aux_output_worker is not None:
-            self.aux_output_worker.begin_step(
-                scheduler_output.aux_output_connector_metadata)
+            meta = scheduler_output.aux_output_connector_metadata
+            pending = getattr(self, "_pending_async_output", None)
+            if (isinstance(pending, AsyncTPUModelRunnerOutput)
+                    and meta is not None
+                    and meta.generation > self.aux_output_worker._generation):
+                pending.get_output()
+            self.aux_output_worker.begin_step(meta)
         if not scheduler_output.total_num_scheduled_tokens:
             if self.scheduler_config.async_scheduling and self._pre_async_results is not None:
                 self._modify_prev_results()
@@ -2056,6 +2088,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 logprobs_tensors=logprobs_tensors,
                 expert_indices=all_expert_indices,
                 scheduler_output=scheduler_output,
+                routed_experts_block_ids=(
+                    _snapshot_block_ids_for_routed_experts(
+                        self, model_runner_output.req_ids,
+                        self.routed_experts_attn_gid) if
+                    (self.aux_output_worker is not None
+                     and all_expert_indices is not None) else None),
                 runner=self,
             )
             async_output._is_continue_decode = True
@@ -2063,6 +2101,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             async_output._max_decode_steps = max_decode_steps
             async_output._min_remaining = min_remaining
             self._continue_decode_output = async_output
+            self._pending_async_output = async_output
             return None
 
         self.rng_params_for_sampling = final_rng
@@ -2368,6 +2407,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                         self.routed_experts_attn_gid)
                     if self.aux_output_worker is not None else None),
                 runner=self)
+            self._pending_async_output = async_model_runner_output
             return async_model_runner_output
 
         valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(

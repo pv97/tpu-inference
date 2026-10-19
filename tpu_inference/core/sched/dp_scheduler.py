@@ -189,8 +189,9 @@ def _scheduler_worker_process(
     import os
 
     enable_continue_decode = False
-    if hasattr(vllm_config, "additional_config"):
-        enable_continue_decode = vllm_config.additional_config.get(
+    additional_config = getattr(vllm_config, "additional_config", None)
+    if isinstance(additional_config, dict):
+        enable_continue_decode = additional_config.get(
             "enable_continue_decode", False)
 
     if enable_continue_decode:
@@ -466,6 +467,16 @@ class DPScheduler(SchedulerInterface):
             caching_hash_fn = get_hash_fn_by_name(
                 vllm_config.cache_config.prefix_caching_hash_algo)
             init_none_hash(caching_hash_fn)
+
+        enable_continue_decode = False
+        additional_config = getattr(vllm_config, "additional_config", None)
+        if isinstance(additional_config, dict):
+            enable_continue_decode = additional_config.get(
+                "enable_continue_decode", False)
+        if enable_continue_decode:
+            from tpu_inference.core.sched.utils import \
+                patch_vllm_scheduler_for_continue_decode
+            patch_vllm_scheduler_for_continue_decode()
 
         # The original scheduler class could be Scheduler or AsyncScheduler
         original_scheduler_cls = vllm_config.scheduler_config._original_scheduler_cls
@@ -1313,14 +1324,20 @@ class DPScheduler(SchedulerInterface):
             # Arrays indexed directly by req_index — just fancy-index rows.
             idx = np.array(global_indices, dtype=np.intp)
             return LogprobsLists(
-                logprob_token_ids=global_logprobs.logprob_token_ids[idx],
-                logprobs=global_logprobs.logprobs[idx],
-                sampled_token_ranks=global_logprobs.sampled_token_ranks[idx],
+                logprob_token_ids=(global_logprobs.logprob_token_ids[idx]
+                                   if global_logprobs.logprob_token_ids
+                                   is not None else None),
+                logprobs=(global_logprobs.logprobs[idx]
+                          if global_logprobs.logprobs is not None else None),
+                sampled_token_ranks=(global_logprobs.sampled_token_ranks[idx]
+                                     if global_logprobs.sampled_token_ranks
+                                     is not None else None),
                 cu_num_generated_tokens=None,
             )
 
         # Variable-length layout: rebuild slices + compact cumulative offsets.
-        total = global_logprobs.logprob_token_ids.shape[0]
+        total = global_logprobs.logprob_token_ids.shape[
+            0] if global_logprobs.logprob_token_ids is not None else 0
         slices = []
         new_cu = [0]
         for gi in global_indices:
@@ -1330,6 +1347,8 @@ class DPScheduler(SchedulerInterface):
             new_cu.append(new_cu[-1] + (end - start))
 
         def _gather(arr):
+            if arr is None:
+                return None
             parts = [arr[s:e] for s, e in slices]
             return np.concatenate(parts, axis=0) if parts else arr[:0]
 

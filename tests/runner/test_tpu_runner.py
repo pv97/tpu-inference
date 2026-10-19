@@ -1284,6 +1284,47 @@ class TestTPUJaxRunnerDisableMM:
         assert entry.block_ids == [3, 4]
         np.testing.assert_array_equal(entry.rows, expert_indices[:2, :, 0, :])
 
+    def test_process_continue_decode_outputs_routed_experts_async_snapshot(
+            self):
+        """_process_continue_decode_outputs builds routed_experts_entries from
+        snapshotted block_ids_by_req even after req_state is popped from runner.requests."""
+        from tpu_inference.runner.tpu_runner import \
+            _process_continue_decode_outputs
+
+        generated_tokens = np.array([[101], [102]], dtype=np.int32)
+        actual_steps = 2
+        req_ids = ["req1"]
+        eos_token_id = 999
+        expert_indices = np.ones((2, 2, 1, 4), dtype=np.int32)
+
+        scheduler_output = SimpleNamespace(
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=["req1"],
+                num_computed_tokens=[20],
+            ))
+
+        _, _, routed_experts_entries, _, _ = _process_continue_decode_outputs(
+            generated_tokens=generated_tokens,
+            actual_steps=actual_steps,
+            req_ids=req_ids,
+            eos_token_id=eos_token_id,
+            expert_indices=expert_indices,
+            enable_return_routed_experts=True,
+            requests={},  # req1 already popped by next step's update_states
+            routed_experts_attn_gid=0,
+            scheduler_output=scheduler_output,
+            is_async=True,
+            block_ids_by_req={"req1": [7, 8]},
+        )
+
+        assert len(routed_experts_entries) == 1
+        entry = routed_experts_entries[0]
+        assert entry.req_id == "req1"
+        assert entry.token_start == 20
+        assert entry.num_accepted == 2
+        assert entry.block_ids == [7, 8]
+        np.testing.assert_array_equal(entry.rows, expert_indices[:2, :, 0, :])
+
     def test_get_min_remaining_slots_mamba_align_mode(self):
         """In mamba align mode, _get_min_remaining_slots caps steps at block boundaries."""
         runner = MagicMock()
@@ -1383,3 +1424,70 @@ class TestTPUJaxRunnerDisableMM:
                 assert entry["dummy_shape"] == (1 if logprobs else 2, )
                 assert entry["temp_shape"] == ((num_reqs, )
                                                if do_sampling else None)
+
+    def test_execute_model_flushes_pending_async_output_on_generation_bump(
+            self):
+        """_execute_model must resolve _pending_async_output before aux_output_worker.begin_step when generation advances."""
+        from vllm.distributed.aux_output_connector.connector import \
+            AuxOutputConnectorMetadata
+
+        from tpu_inference.runner.routed_experts import TPUAuxOutputWorker
+        from tpu_inference.runner.tpu_runner import (AsyncTPUModelRunnerOutput,
+                                                     ModelRunnerOutput,
+                                                     TPUModelRunner)
+
+        vllm_config = MagicMock()
+        vllm_config.model_config.get_num_experts.return_value = 8
+        kv_cache_config = MagicMock(num_blocks=16)
+        aux_worker = TPUAuxOutputWorker(vllm_config,
+                                        kv_cache_config,
+                                        block_size=4,
+                                        dp_size=1)
+        aux_worker.begin_step(AuxOutputConnectorMetadata(0, {"r0": 0}, {}, ()))
+        assert aux_worker._requests["r0"].pending_steps == 1
+
+        runner = MagicMock()
+        runner.scheduler_config.async_scheduling = True
+        runner._pre_async_results = None
+        runner.aux_output_worker = aux_worker
+
+        base_out = ModelRunnerOutput(
+            req_ids=["r0"],
+            req_id_to_index={"r0": 0},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+        pending = AsyncTPUModelRunnerOutput(
+            base_out,
+            np.array([[10], [20]], dtype=np.int32),
+            1,
+            [],
+            logits_indices_selector=None,
+            routed_experts_block_ids={"r0": [1]},
+            runner=runner,
+        )
+        pending._is_continue_decode = True
+        pending._actual_steps_future = np.int32(2)
+        pending._max_decode_steps = 2
+        pending._min_remaining = 2
+        runner._pending_async_output = pending
+
+        sched_out = MagicMock()
+        sched_out.total_num_scheduled_tokens = 0
+        sched_out.finished_req_ids = ["r0"]
+        sched_out.aux_output_connector_metadata = AuxOutputConnectorMetadata(
+            1, {"r1": 0}, {}, ())
+
+        with patch("tpu_inference.runner.tpu_runner.has_kv_transfer_group",
+                   return_value=False):
+            TPUModelRunner._execute_model(runner, sched_out)
+
+        assert runner._pending_async_output is None
+        assert aux_worker._generation == 1
+        assert set(aux_worker._requests) == {"r1"}
+        # Subsequent get_output() from batch_queue.pop() must be a no-op on aux_worker.
+        resolved = pending.get_output()
+        assert resolved.sampled_token_ids == [[10, 20]]
+        assert aux_worker._requests["r1"].pending_steps == 1
